@@ -23,7 +23,7 @@ fi
 
 host="$1"
 port="$2"
-if [[ -z "$host" || "$host" == *[[:cntrl:]]* || "$port" != <-> || "$port" -lt 1 || "$port" -gt 65535 ]]; then
+if [[ "$host" != [A-Za-z0-9][A-Za-z0-9.-]# || "$port" != <-> || "$port" -lt 1 || "$port" -gt 65535 ]]; then
   say_error "ShanghaiTech SSH route: invalid destination"
   exit 64
 fi
@@ -40,25 +40,14 @@ if [[ "$owner" != "$current_uid" || "$mode" != "600" ]]; then
 fi
 
 matched=0
+typeset -A seen_targets
 while IFS= read -r line || [[ -n "$line" ]]; do
-  [[ -n "$line" ]] || {
-    say_error "ShanghaiTech SSH route: malformed target allowlist"
-    exit 255
-  }
-  without_tabs="${line//$'\t'/}"
-  (( ${#line} - ${#without_tabs} == 3 )) || {
-    say_error "ShanghaiTech SSH route: malformed target allowlist"
-    exit 255
-  }
-  IFS=$'\t' read -r target_alias target_host target_port target_user <<<"$line"
-  if [[ "$target_alias" != [A-Za-z0-9][A-Za-z0-9._-]# ||
-        "$target_host" != [A-Za-z0-9][A-Za-z0-9.-]# ||
-        "$target_port" != <-> || "$target_port" -lt 1 || "$target_port" -gt 65535 ||
-        ( "$target_user" != "-" && "$target_user" != [A-Za-z_][A-Za-z0-9_.-]# ) ]]; then
+  if [[ "$line" != [A-Za-z0-9][A-Za-z0-9.-]# || "$line" == *$'\t'* || -n "${seen_targets[$line]:-}" ]]; then
     say_error "ShanghaiTech SSH route: malformed target allowlist"
     exit 255
   fi
-  if [[ "$target_host" == "$host" && "$target_port" == "$port" ]]; then
+  seen_targets[$line]=1
+  if [[ "$line" == "$host" ]]; then
     matched=$(( matched + 1 ))
   fi
 done <"$targets_file"

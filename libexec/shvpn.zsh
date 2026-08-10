@@ -15,6 +15,7 @@ typeset -gr bind_port="11080"
 typeset -gr current_uid="$(/usr/bin/id -u)"
 typeset -gr expected_client_command="$client -protocol atrust -server vpn.shanghaitech.edu.cn -port 443 -login-domain Shanghaitech.edu.cn -auth-type auth/cas -client-data-file $client_data -socks-bind $bind_host:$bind_port -http-bind  -auto-detect-interface"
 typeset -gr expected_wrapper_command="/bin/zsh $launcher"
+typeset -g operation_lock_fd
 
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 
@@ -154,9 +155,13 @@ acquire_operation_lock() {
     say_error "shvpn: unsafe lock path: $lock_file"
     return 69
   fi
-  exec 9>>"$lock_file" || return 69
+  /usr/bin/touch "$lock_file" || return 69
   /bin/chmod 600 "$lock_file" || return 69
-  if ! /usr/bin/lockf -s -t 0 9; then
+  if ! zmodload zsh/system; then
+    say_error "shvpn: zsh/system locking support is unavailable"
+    return 69
+  fi
+  if ! zsystem flock -t 0 -f operation_lock_fd -e "$lock_file"; then
     say_error "shvpn: another start, stop, or login operation is in progress"
     return 75
   fi
@@ -290,7 +295,7 @@ start_vpn() {
   fi
 
   print -r -- "=== shvpn start $(/bin/date -u +%Y-%m-%dT%H:%M:%SZ) command-pid=$$ ===" >>"$log_file"
-  /usr/bin/nohup "$launcher" 9>&- </dev/null >>"$log_file" 2>&1 &
+  /usr/bin/nohup "$launcher" </dev/null >>"$log_file" 2>&1 &
   wrapper_pid=$!
 
   for (( i = 0; i < 80; i++ )); do
@@ -429,7 +434,7 @@ login_vpn() {
     return 2
   fi
 
-  "$launcher" 9>&-
+  "$launcher"
   return $?
 }
 

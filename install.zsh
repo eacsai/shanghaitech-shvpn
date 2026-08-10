@@ -22,7 +22,7 @@ die() {
 
 usage() {
   print -u2 -r -- "usage: ./install.zsh"
-  print -u2 -r -- "   or: ./install.zsh --non-interactive --target ALIAS HOST PORT USER_OR_DASH [--target ...] (--add-path|--no-path)"
+  print -u2 -r -- "   or: ./install.zsh --non-interactive --target HOST [--target HOST ...] (--add-path|--no-path)"
 }
 
 sha_file() {
@@ -179,21 +179,12 @@ restore_snapshot() {
 }
 
 validate_target() {
-  local alias="$1"
-  local host="$2"
-  local port="$3"
-  local user="$4"
-  [[ "$alias" == [A-Za-z0-9][A-Za-z0-9._-]# ]] || die 64 "invalid SSH alias: $alias"
+  local host="$1"
   [[ "$host" == [A-Za-z0-9][A-Za-z0-9.-]# ]] || die 64 "invalid SSH host: $host"
-  [[ "$port" == <-> && "$port" -ge 1 && "$port" -le 65535 ]] || die 64 "invalid SSH port: $port"
-  [[ "$user" == "-" || "$user" == [A-Za-z_][A-Za-z0-9_.-]# ]] || die 64 "invalid SSH user: $user"
 }
 
-typeset -a target_aliases target_hosts target_ports target_users
-target_aliases=()
+typeset -a target_hosts
 target_hosts=()
-target_ports=()
-target_users=()
 non_interactive=0
 path_choice=""
 
@@ -204,12 +195,9 @@ while (( $# > 0 )); do
       shift
       ;;
     --target)
-      (( $# >= 5 )) || { usage; exit 64; }
-      target_aliases+=("$2")
-      target_hosts+=("$3")
-      target_ports+=("$4")
-      target_users+=("$5")
-      shift 5
+      (( $# >= 2 )) || { usage; exit 64; }
+      target_hosts+=("$2")
+      shift 2
       ;;
     --add-path)
       [[ -z "$path_choice" ]] || die 64 "choose only one PATH policy"
@@ -231,32 +219,26 @@ done
 if (( non_interactive )); then
   [[ -n "$path_choice" ]] || die 64 "non-interactive mode requires --add-path or --no-path"
 else
-  (( ${#target_aliases} == 0 )) || die 64 "--target requires --non-interactive"
+  (( ${#target_hosts} == 0 )) || die 64 "--target requires --non-interactive"
   [[ -n "$path_choice" ]] || path_choice="add"
-  print -r -- "配置需要通过 VPN 访问的 SSH 目标；alias 留空即可结束。"
+  print -r -- "配置需要通过 VPN 访问的 SSH 服务器；地址留空即可结束。"
   while true; do
-    read "target_alias?SSH alias（例如 gpu）："
-    [[ -n "$target_alias" ]] || break
-    read "target_host?服务器地址："
-    read "target_port?SSH 端口（通常为 22）："
-    read "target_user?SSH 用户名（留空则不写 User）："
-    [[ -n "$target_user" ]] || target_user="-"
-    target_aliases+=("$target_alias")
+    read "target_host?服务器地址（留空结束）："
+    [[ -n "$target_host" ]] || break
     target_hosts+=("$target_host")
-    target_ports+=("$target_port")
-    target_users+=("$target_user")
   done
 fi
 
-typeset -A seen_aliases
-for (( i = 1; i <= ${#target_aliases}; i++ )); do
-  validate_target "${target_aliases[i]}" "${target_hosts[i]}" "${target_ports[i]}" "${target_users[i]}"
-  [[ -z "${seen_aliases[${target_aliases[i]}]:-}" ]] || die 64 "duplicate SSH alias: ${target_aliases[i]}"
-  seen_aliases[${target_aliases[i]}]=1
+(( ${#target_hosts} > 0 )) || die 64 "at least one SSH server address is required"
+typeset -A seen_hosts
+for target_host in "${target_hosts[@]}"; do
+  validate_target "$target_host"
+  [[ -z "${seen_hosts[$target_host]:-}" ]] || die 64 "duplicate SSH host: $target_host"
+  seen_hosts[$target_host]=1
 done
 
 [[ "$(/usr/bin/uname -s)" == "Darwin" && "$(/usr/bin/uname -m)" == "arm64" ]] || die 69 "version 1 supports Apple Silicon macOS only"
-for command_name in zsh git go codesign ssh nc shasum lsof lockf; do
+for command_name in zsh git go codesign ssh nc shasum lsof; do
   command -v "$command_name" >/dev/null 2>&1 || die 69 "required command not found: $command_name"
 done
 
@@ -353,6 +335,11 @@ on_exit() {
 trap 'on_exit $?' EXIT
 trap 'exit 130' INT TERM
 
+: >"$work_dir/zsystem-flock-smoke.lock"
+/bin/chmod 600 "$work_dir/zsystem-flock-smoke.lock" || die 74 "cannot harden zsystem flock smoke file"
+/bin/zsh -fc 'zmodload zsh/system && typeset -g operation_lock_fd && zsystem flock -t 0 -f operation_lock_fd -e "$1"' \
+  shvpn-lock-smoke "$work_dir/zsystem-flock-smoke.lock" || die 69 "zsh/system nonblocking flock is unavailable"
+
 "$project_root/libexec/build-client.zsh" "$work_dir/zju-connect"
 
 quote_for_zsh() {
@@ -391,14 +378,10 @@ print -rn -- "$content" >"$work_dir/shanghaitech-ssh-route"
 : >"$work_dir/targets.tsv"
 : >"$work_dir/ssh.block"
 print -r -- "$begin_ssh" >>"$work_dir/ssh.block"
-for (( i = 1; i <= ${#target_aliases}; i++ )); do
-  print -r -- "${target_aliases[i]}${TAB}${target_hosts[i]}${TAB}${target_ports[i]}${TAB}${target_users[i]}" >>"$work_dir/targets.tsv"
-  print -r -- "Host ${target_aliases[i]}" >>"$work_dir/ssh.block"
-  print -r -- "    HostName ${target_hosts[i]}" >>"$work_dir/ssh.block"
-  print -r -- "    Port ${target_ports[i]}" >>"$work_dir/ssh.block"
-  if [[ "${target_users[i]}" != "-" ]]; then
-    print -r -- "    User ${target_users[i]}" >>"$work_dir/ssh.block"
-  fi
+for target_host in "${target_hosts[@]}"; do
+  print -r -- "$target_host" >>"$work_dir/targets.tsv"
+  print -r -- "Host $target_host" >>"$work_dir/ssh.block"
+  print -r -- "    HostName $target_host" >>"$work_dir/ssh.block"
   print -r -- "    ProxyCommand $route_command_q %h %p" >>"$work_dir/ssh.block"
 done
 print -r -- "$end_ssh" >>"$work_dir/ssh.block"
@@ -423,7 +406,7 @@ discovered_ssh="$(command -v ssh)"
 typeset -a ssh_candidates
 typeset -A seen_ssh_clients
 ssh_candidates=(/usr/bin/ssh /opt/homebrew/bin/ssh "$discovered_ssh")
-for (( i = 1; i <= ${#target_aliases}; i++ )); do
+for target_host in "${target_hosts[@]}"; do
   validated_ssh_clients=0
   seen_ssh_clients=()
   for ssh_client in "${ssh_candidates[@]}"; do
@@ -432,18 +415,13 @@ for (( i = 1; i <= ${#target_aliases}; i++ )); do
     [[ -f "$ssh_client" && -x "$ssh_client" ]] || continue
     [[ -z "${seen_ssh_clients[$ssh_client]:-}" ]] || continue
     seen_ssh_clients[$ssh_client]=1
-    ssh_output="$($ssh_client -F "$work_dir/ssh.config" -G "${target_aliases[i]}" 2>/dev/null)" || die 65 "ssh -G rejected target ${target_aliases[i]}"
+    ssh_output="$($ssh_client -F "$work_dir/ssh.config" -G "$target_host" 2>/dev/null)" || die 65 "ssh -G rejected target $target_host"
     resolved_host="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')"
-    resolved_port="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "port" {print $2; exit}')"
     resolved_proxy="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')"
-    [[ "$resolved_host" == "${target_hosts[i]}" && "$resolved_port" == "${target_ports[i]}" && "$resolved_proxy" == "$route_command_q %h %p" ]] || die 65 "SSH target ${target_aliases[i]} resolves outside the managed configuration"
-    if [[ "${target_users[i]}" != "-" ]]; then
-      resolved_user="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "user" {print $2; exit}')"
-      [[ "$resolved_user" == "${target_users[i]}" ]] || die 65 "SSH user mismatch for ${target_aliases[i]}"
-    fi
+    [[ "$resolved_host" == "$target_host" && "$resolved_proxy" == "$route_command_q %h %p" ]] || die 65 "SSH target $target_host resolves outside the managed configuration"
     validated_ssh_clients=$(( validated_ssh_clients + 1 ))
   done
-  (( validated_ssh_clients > 0 )) || die 69 "no usable OpenSSH client validated target ${target_aliases[i]}"
+  (( validated_ssh_clients > 0 )) || die 69 "no usable OpenSSH client validated target $target_host"
 done
 
 marker_count "$zshrc" "$begin_path" || die 65 "cannot inspect PATH markers"
@@ -563,7 +541,7 @@ else
   print -r -- "  $shvpn status"
   print -r -- "  $shvpn stop"
 fi
-for target_alias in "${target_aliases[@]}"; do
-  print -r -- "  ssh $target_alias"
+for target_host in "${target_hosts[@]}"; do
+  print -r -- "  ssh $target_host"
 done
 print -r -- "安装器没有启动 VPN，也没有修改 Clash 或 macOS 系统代理。"

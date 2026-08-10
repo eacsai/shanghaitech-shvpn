@@ -10,7 +10,7 @@
 - `shvpn login` 负责首次登录或登录过期后的浏览器 CAS 流程。
 - `shvpn` 后台启动，`shvpn stop` 安全关闭。
 - 只有安装时列出的 SSH 目标使用本地 SOCKS 端口 `127.0.0.1:11080`。
-- 在校内、VPN 未启动时，同一个 `ssh <alias>` 自动走直连。
+- 在校内、VPN 未启动时，同一个 `ssh <服务器地址>` 自动走直连。
 - 终端、VS Code Remote-SSH 以及调用系统 OpenSSH 的 Codex 使用同一份配置。
 - 不退出、不修改 Clash Verge，也不启用 TUN 或 macOS 系统代理。
 
@@ -35,7 +35,7 @@ cd shanghaitech-shvpn
 ./install.zsh
 ```
 
-安装器会询问需要通过 VPN 访问的 SSH alias、服务器地址、端口和用户名。它只接受这些普通配置，不会询问密码、短信验证码、SSH 私钥或 VPN 回调地址。
+安装器只会反复询问需要通过 VPN 访问的服务器地址，至少需要一个。它不会询问 SSH alias、端口、用户名、密码、短信验证码、SSH 私钥或 VPN 回调地址。
 
 安装结束后新开一个终端：
 
@@ -43,7 +43,7 @@ cd shanghaitech-shvpn
 shvpn login    # 第一次使用；登录过期时也运行它
 shvpn          # 以后后台启动
 shvpn status
-ssh gpu        # 换成你配置的 alias
+ssh gpu1.example.edu   # 换成你配置的服务器地址
 shvpn stop
 ```
 
@@ -51,12 +51,7 @@ shvpn stop
 
 ## 让 Codex 帮你配置
 
-打开 [CODEX_SETUP.md](CODEX_SETUP.md)，复制其中的提示词给 Codex。Codex 只需要向你确认：
-
-1. SSH alias；
-2. 服务器地址；
-3. SSH 端口；
-4. SSH 用户名（可留空）。
+打开 [CODEX_SETUP.md](CODEX_SETUP.md)，复制其中的提示词给 Codex。Codex 只需要向你确认一个或多个服务器地址。
 
 Codex 不需要、也不应该读取你的密码、私钥、`client-data.json` 或完整 VPN 日志。
 
@@ -64,18 +59,27 @@ Codex 不需要、也不应该读取你的密码、私钥、`client-data.json` �
 
 ```zsh
 ./install.zsh --non-interactive \
-  --target gpu 192.0.2.10 22 alice \
-  --target gpu2 192.0.2.20 22 - \
+  --target gpu1.example.edu \
+  --target gpu2.example.edu \
   --add-path
 ```
 
-最后一个字段写 `-` 表示不生成 `User`。如果不希望修改 `~/.zshrc`，使用 `--no-path`；此时安装器会输出 `$HOME/.local/bin/shvpn` 的完整命令。
+每个 `--target` 后只写一个服务器地址。如果不希望修改 `~/.zshrc`，使用 `--no-path`；此时安装器会输出 `$HOME/.local/bin/shvpn` 的完整命令。
+
+用户名和非默认端口在连接时照常交给 OpenSSH，例如：
+
+```zsh
+ssh alice@gpu1.example.edu
+ssh -p 2222 alice@gpu1.example.edu
+```
+
+从旧版重装会把受信任的旧 alias/host/port/user 托管块原子替换为地址模式。旧 alias 以及安装器写入的 `Port`、`User` 会消失；请改用服务器地址连接，并在命令行或你自己的非托管 SSH 配置中提供用户名和端口。
 
 ## 网络路径
 
 ```text
-ssh gpu
-  └─ ProxyCommand（仅这个 alias）
+ssh gpu1.example.edu
+  └─ ProxyCommand（仅这个服务器地址）
        ├─ shvpn 正在可信运行 → 127.0.0.1:11080 → 上科大 VPN → GPU
        ├─ shvpn 已停止       → 直接连接 GPU（适合校内）
        └─ 状态不可信         → 拒绝连接
@@ -87,6 +91,7 @@ SSH 已存在的 ControlMaster 连接会继续使用建立时的路径；新终�
 
 - 上游固定为 `v1.2.2` / `a759261b76ed653900911559400005b40a31392a`，并验证 `go.mod`、`go.sum` 后才应用补丁。
 - VPN 进程按当前用户、可执行文件、完整命令参数和 SOCKS 监听者共同校验；不可信状态不会被停止或代理。
+- `start`、`stop`、`login` 通过 zsh 原生的非阻塞 advisory lock 串行执行；锁冲突返回 `75`，后台 VPN 不会继承锁描述符。
 - SSH 与 PATH 配置使用明确的托管标记；重复安装不会重复追加。
 - 安装前的文件会按哈希备份在 `~/.local/lib/shanghaitech-shvpn/backups/`。
 - 如果已经存在 `~/.local/bin/zju-connect`，安装器只会在它是当前用户拥有的普通文件时备份并替换；符号链接或不明确状态会被拒绝。卸载时会恢复原文件。
@@ -112,7 +117,7 @@ shvpn login
 
 ### 为什么没有代理所有校园地址？
 
-这是刻意的安全边界。本项目只为安装时列出的 SSH 目标生成 `ProxyCommand`，因此不会影响网页、Clash 或其他应用。
+这是刻意的安全边界。本项目只为安装时列出的 SSH 服务器地址生成 `ProxyCommand`，因此不会影响网页、Clash 或其他应用。列入允许清单的地址可以使用任意有效 SSH 端口（`1`–`65535`，例如 `ssh -p 2222 ...`）；未列出的地址仍会被拒绝。
 
 ### VS Code 仍走旧路径
 
@@ -126,4 +131,4 @@ shvpn login
 
 ---
 
-**English summary:** An unofficial, source-built Apple-Silicon macOS helper for ShanghaiTech aTrust/CAS. It exposes `shvpn` and routes only explicitly configured SSH aliases through a local SOCKS proxy, leaving Clash and other traffic unchanged. See the Chinese guide above for requirements and safety boundaries.
+**English summary:** An unofficial, source-built Apple-Silicon macOS helper for ShanghaiTech aTrust/CAS. It exposes `shvpn` and routes only explicitly configured SSH server addresses through a local SOCKS proxy, leaving Clash and other traffic unchanged. See the Chinese guide above for requirements and safety boundaries.
