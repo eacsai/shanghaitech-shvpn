@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+          check-latest: false
+      - name: Verify toolchain
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test "$(go version)" = "go version go1.25.6 darwin/arm64"
+      - name: Run source, privacy, fixture, patch, and build gates
+        env:
+          SHVPN_RUN_UPSTREAM: '1'
+        run: /bin/zsh tests/test.zsh

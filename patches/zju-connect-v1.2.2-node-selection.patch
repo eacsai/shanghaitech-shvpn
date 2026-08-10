@@ -1,0 +1,91 @@
+diff --git a/client/atrust/node.go b/client/atrust/node.go
+index 7c1fd59..95db621 100644
+--- a/client/atrust/node.go
++++ b/client/atrust/node.go
+@@ -20,0 +21 @@ func getBestNodes(nodeGroups map[string][]string, dialContext func(context.Conte
++			var pingNodes []string
+@@ -43,0 +45 @@ func getBestNodes(nodeGroups map[string][]string, dialContext func(context.Conte
++				pingNodes = append(pingNodes, node)
+@@ -60 +62 @@ func getBestNodes(nodeGroups map[string][]string, dialContext func(context.Conte
+-						bestNode = nodes[i]
++						bestNode = pingNodes[i]
+@@ -70,2 +72,6 @@ func getBestNodes(nodeGroups map[string][]string, dialContext func(context.Conte
+-				log.Printf("No reachable node in group %s, using the first node", group)
+-				bestNodes[group] = nodes[0]
++				log.Printf("No reachable node in group %s, using the first probeable node", group)
++				if len(pingNodes) > 0 {
++					bestNodes[group] = pingNodes[0]
++				} else {
++					bestNodes[group] = nodes[0]
++				}
+diff --git a/client/atrust/node_test.go b/client/atrust/node_test.go
+new file mode 100644
+--- /dev/null
++++ b/client/atrust/node_test.go
+@@ -0,0 +1,66 @@
++package atrust
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"sync/atomic"
++	"testing"
++)
++
++func TestGetBestNodesKeepsNodeAlignedWhenIPv6IsSkipped(t *testing.T) {
++	const group = "test-group"
++	const ipv6Node = "[2001:db8::1]:441"
++	const ipv4Node = "192.0.2.10:441"
++
++	var calls atomic.Int32
++	dialContext := func(_ context.Context, _ string, address string) (net.Conn, error) {
++		calls.Add(1)
++		if address != ipv4Node {
++			return nil, fmt.Errorf("unexpected probe address %q", address)
++		}
++
++		client, server := net.Pipe()
++		if err := server.Close(); err != nil {
++			return nil, err
++		}
++		return client, nil
++	}
++
++	bestNodes := getBestNodes(map[string][]string{
++		group: {ipv6Node, ipv4Node},
++	}, dialContext)
++
++	if got := bestNodes[group]; got != ipv4Node {
++		t.Fatalf("best node = %q, want %q", got, ipv4Node)
++	}
++	if got := calls.Load(); got != pingNum {
++		t.Fatalf("dial calls = %d, want %d", got, pingNum)
++	}
++}
++
++func TestGetBestNodesFallbackUsesFirstProbeableNode(t *testing.T) {
++	const group = "test-group"
++	const ipv6Node = "[2001:db8::1]:441"
++	const ipv4Node = "192.0.2.10:441"
++
++	var calls atomic.Int32
++	dialContext := func(_ context.Context, _ string, address string) (net.Conn, error) {
++		calls.Add(1)
++		if address != ipv4Node {
++			return nil, fmt.Errorf("unexpected probe address %q", address)
++		}
++		return nil, fmt.Errorf("simulated probe failure")
++	}
++
++	bestNodes := getBestNodes(map[string][]string{
++		group: {ipv6Node, ipv4Node},
++	}, dialContext)
++
++	if got := bestNodes[group]; got != ipv4Node {
++		t.Fatalf("fallback node = %q, want %q", got, ipv4Node)
++	}
++	if got := calls.Load(); got != pingNum {
++		t.Fatalf("dial calls = %d, want %d", got, pingNum)
++	}
++}
