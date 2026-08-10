@@ -9,6 +9,7 @@ typeset -gr end_ssh="# <<< shanghaitech-shvpn managed SSH targets <<<"
 typeset -gr begin_path="# >>> shanghaitech-shvpn managed PATH >>>"
 typeset -gr end_path="# <<< shanghaitech-shvpn managed PATH <<<"
 typeset -gr current_uid="$(/usr/bin/id -u)"
+typeset -g config_lock_fd
 
 say_error() {
   print -u2 -r -- "$*"
@@ -129,6 +130,23 @@ restore_baseline() {
   esac
 }
 
+acquire_config_lock() {
+  local lock_dir="${config_lock:h}"
+  if [[ -e "$lock_dir" || -L "$lock_dir" ]]; then
+    [[ -d "$lock_dir" && ! -L "$lock_dir" && "$(/usr/bin/stat -f %u "$lock_dir" 2>/dev/null)" == "$current_uid" ]] || die 69 "unsafe state directory: $lock_dir"
+  else
+    /usr/bin/install -d -m 700 "$lock_dir" || die 74 "cannot create state directory"
+  fi
+  /bin/chmod 700 "$lock_dir" || die 74 "cannot harden state directory"
+  if [[ -e "$config_lock" || -L "$config_lock" ]]; then
+    safe_regular_or_absent "$config_lock" || die 69 "unsafe configuration lock: $config_lock"
+  fi
+  /usr/bin/touch "$config_lock" || die 74 "cannot create configuration lock"
+  /bin/chmod 600 "$config_lock" || die 74 "cannot harden configuration lock"
+  zmodload zsh/system || die 69 "zsh/system locking support is unavailable"
+  zsystem flock -t 0 -f config_lock_fd -e "$config_lock" || die 75 "another shvpn configuration or lifecycle operation is in progress"
+}
+
 home_dir="${HOME:A}"
 [[ -d "$home_dir" && ! -L "$home_dir" && "$home_dir" == /* ]] || die 69 "HOME is not a safe physical directory"
 [[ "$home_dir" != *$'\n'* && "$home_dir" != *$'\r'* && "$home_dir" != *$'\t'* && "$home_dir" != *'|'* ]] || die 69 "HOME contains unsupported characters"
@@ -145,19 +163,30 @@ client="$bin_dir/zju-connect"
 launcher="$bin_dir/shanghaitech-vpn"
 shvpn="$bin_dir/shvpn"
 route="$bin_dir/shanghaitech-ssh-route"
+config_helper="$lib_dir/configure-targets.zsh"
+uninstall_helper="$lib_dir/uninstall.zsh"
+state_dir="$home_dir/Library/Application Support/ShanghaitechVPN"
+config_lock="$state_dir/shvpn.config.lock"
 
 [[ -d "$lib_dir" && ! -L "$lib_dir" && "$(/usr/bin/stat -f %u "$lib_dir" 2>/dev/null)" == "$current_uid" ]] || die 69 "trusted installation metadata was not found"
 [[ -f "$manifest" && ! -L "$manifest" && "$(/usr/bin/stat -f %Lp "$manifest")" == "600" ]] || die 69 "trusted install manifest was not found"
 [[ -d "$baseline_dir" && ! -L "$baseline_dir" && -f "$baseline_dir/COMPLETE" ]] || die 65 "baseline metadata is incomplete"
 manifest_get format "$manifest" || die 65 "invalid install manifest"
-[[ "$REPLY" == "1" ]] || die 65 "unsupported install manifest"
+install_format="$REPLY"
+[[ "$install_format" == "1" || "$install_format" == "2" ]] || die 65 "unsupported install manifest"
 manifest_get path-choice "$manifest" || die 65 "invalid PATH policy in manifest"
 path_choice="$REPLY"
 [[ "$path_choice" == "add" || "$path_choice" == "none" ]] || die 65 "invalid PATH policy in manifest"
 
-for managed_path in "$client" "$launcher" "$shvpn" "$route" "$targets_file" "$ssh_config" "$zshrc"; do
+for managed_path in "$client" "$launcher" "$shvpn" "$route" "$targets_file" "$ssh_config" "$zshrc" "$config_lock"; do
   safe_regular_or_absent "$managed_path" || die 69 "unsafe managed path: $managed_path"
 done
+if [[ "$install_format" == "2" ]]; then
+  for managed_path in "$config_helper" "$uninstall_helper"; do
+    safe_regular_or_absent "$managed_path" || die 69 "unsafe managed helper: $managed_path"
+    [[ ! -f "$managed_path" || "$(/usr/bin/stat -f %Lp "$managed_path")" == "700" ]] || die 69 "managed helper has unsafe mode: $managed_path"
+  done
+fi
 
 temp_parent="${TMPDIR:-/tmp}"
 [[ -d "$temp_parent" && "$temp_parent" == /* ]] || die 69 "TMPDIR must name an existing absolute directory"
@@ -167,7 +196,8 @@ cleanup_work() {
     /bin/rm -rf -- "$work_dir"
   fi
 }
-trap cleanup_work EXIT INT TERM
+trap cleanup_work EXIT
+trap 'exit 130' INT TERM
 
 preflight_failed=0
 preflight_file() {
@@ -224,18 +254,25 @@ preflight_block() {
   fi
 }
 
-preflight_file zju-connect "$client"
-preflight_file shanghaitech-vpn "$launcher"
-preflight_file shvpn "$shvpn"
-preflight_file shanghaitech-ssh-route "$route"
-preflight_file targets "$targets_file"
-preflight_block ssh-block ssh-full "$ssh_config" "$begin_ssh" "$end_ssh" ssh
-if [[ "$path_choice" == "add" ]]; then
-  preflight_block path-block path-full "$zshrc" "$begin_path" "$end_path" path
-fi
-if (( preflight_failed )); then
-  die 2 "nothing was changed; resolve the reported modified or ambiguous files first"
-fi
+run_preflight() {
+  preflight_failed=0
+  preflight_file zju-connect "$client"
+  preflight_file shanghaitech-vpn "$launcher"
+  preflight_file shvpn "$shvpn"
+  preflight_file shanghaitech-ssh-route "$route"
+  preflight_file targets "$targets_file"
+  if [[ "$install_format" == "2" ]]; then
+    preflight_file config-helper "$config_helper"
+    preflight_file uninstall-helper "$uninstall_helper"
+  fi
+  preflight_block ssh-block ssh-full "$ssh_config" "$begin_ssh" "$end_ssh" ssh
+  if [[ "$path_choice" == "add" ]]; then
+    preflight_block path-block path-full "$zshrc" "$begin_path" "$end_path" path
+  fi
+  (( preflight_failed == 0 ))
+}
+
+run_preflight || die 2 "nothing was changed; resolve the reported modified or ambiguous files first"
 
 set +e
 "$shvpn" status >/dev/null 2>&1
@@ -252,6 +289,26 @@ case "$vpn_status" in
     ;;
   *)
     die 75 "unexpected shvpn status: $vpn_status"
+    ;;
+esac
+
+acquire_config_lock
+run_preflight || die 2 "nothing was changed; installation state changed while uninstall was waiting"
+set +e
+"$shvpn" status >/dev/null 2>&1
+vpn_status=$?
+set -e
+case "$vpn_status" in
+  1)
+    ;;
+  2)
+    say_error "uninstall: port 127.0.0.1:11080 is untrusted or ambiguous; leaving that process untouched and continuing"
+    ;;
+  0)
+    die 75 "VPN restarted while uninstall was waiting for the configuration lock; nothing was changed"
+    ;;
+  *)
+    die 75 "unexpected shvpn status after locking: $vpn_status"
     ;;
 esac
 

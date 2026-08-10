@@ -12,6 +12,10 @@ typeset -gr targets_file=@@TARGETS_Q@@
 typeset -gr route=@@ROUTE_Q@@
 typeset -gr expected_route_proxy=@@ROUTE_PROXY_Q@@
 typeset -gr ssh_config=@@SSH_CONFIG_Q@@
+typeset -gr manifest=@@MANIFEST_Q@@
+typeset -gr config_helper=@@CONFIG_HELPER_Q@@
+typeset -gr uninstall_helper=@@UNINSTALL_HELPER_Q@@
+typeset -gr config_lock_file=@@CONFIG_LOCK_Q@@
 typeset -gr ssh_root="${ssh_config:h}"
 typeset -gr ssh_client="/usr/bin/ssh"
 typeset -gr client_data="$state_dir/client-data.json"
@@ -23,6 +27,7 @@ typeset -gr current_uid="$(/usr/bin/id -u)"
 typeset -gr expected_client_command="$client -protocol atrust -server vpn.shanghaitech.edu.cn -port 443 -login-domain Shanghaitech.edu.cn -auth-type auth/cas -client-data-file $client_data -socks-bind $bind_host:$bind_port -http-bind  -auto-detect-interface"
 typeset -gr expected_wrapper_command="/bin/zsh $launcher"
 typeset -g operation_lock_fd
+typeset -g config_lock_fd
 
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 
@@ -31,7 +36,9 @@ say_error() {
 }
 
 usage() {
-  print -u2 -r -- "usage: shvpn [start|stop|status|login]"
+  print -u2 -r -- "usage: shvpn [start|stop|status|login|uninstall]"
+  print -u2 -r -- "   or: shvpn add SSH_NAME_OR_HOST"
+  print -u2 -r -- "   or: shvpn remove SSH_NAME_OR_HOST"
   print -u2 -r -- "   or: shvpn doctor [SSH_NAME ...]"
   print -u2 -r -- "   or: shvpn reconnect [SSH_NAME ...]"
 }
@@ -50,6 +57,55 @@ safe_owned_regular() {
 
 safe_owned_executable() {
   safe_owned_regular "$1" && [[ -x "$1" ]]
+}
+
+sha_file() {
+  REPLY="$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}')" || return 1
+}
+
+manifest_get() {
+  local key="$1"
+  REPLY="$(/usr/bin/awk -F '\t' -v key="$key" '
+    $1 == key { count++; value=$2 }
+    END { if (count != 1 || value == "") exit 65; print value }
+  ' "$manifest")" || return 1
+}
+
+verify_installed_helper() {
+  local key="$1"
+  local helper="$2"
+  local mode expected
+  if ! safe_owned_regular "$manifest"; then
+    say_error "shvpn: install manifest is missing or unsafe"
+    return 69
+  fi
+  mode="$(/usr/bin/stat -f %Lp "$manifest" 2>/dev/null)" || return 69
+  if [[ "$mode" != "600" ]]; then
+    say_error "shvpn: install manifest mode is unsafe"
+    return 69
+  fi
+  manifest_get format || { say_error "shvpn: invalid install manifest"; return 65; }
+  if [[ "$REPLY" != "2" ]]; then
+    say_error "shvpn: this command requires install manifest format 2; reinstall shvpn"
+    return 65
+  fi
+  if ! safe_owned_executable "$helper"; then
+    say_error "shvpn: managed helper is missing or unsafe: $helper"
+    return 69
+  fi
+  mode="$(/usr/bin/stat -f %Lp "$helper" 2>/dev/null)" || return 69
+  if [[ "$mode" != "700" ]]; then
+    say_error "shvpn: managed helper mode is unsafe: $helper"
+    return 69
+  fi
+  manifest_get "$key" || { say_error "shvpn: missing install manifest entry: $key"; return 65; }
+  expected="$REPLY"
+  sha_file "$helper" || return 74
+  if [[ "$REPLY" != "$expected" ]]; then
+    say_error "shvpn: managed helper was modified; refusing: $helper"
+    return 2
+  fi
+  return 0
 }
 
 validate_ssh_name() {
@@ -552,6 +608,24 @@ prepare_runtime() {
   return 0
 }
 
+acquire_config_lock() {
+  if [[ -e "$config_lock_file" && ( ! -f "$config_lock_file" || -L "$config_lock_file" ) ]]; then
+    say_error "shvpn: unsafe configuration lock: $config_lock_file"
+    return 69
+  fi
+  /usr/bin/touch "$config_lock_file" || return 69
+  /bin/chmod 600 "$config_lock_file" || return 69
+  if ! zmodload zsh/system; then
+    say_error "shvpn: zsh/system locking support is unavailable"
+    return 69
+  fi
+  if ! zsystem flock -t 0 -f config_lock_fd -e "$config_lock_file"; then
+    say_error "shvpn: another shvpn configuration or lifecycle operation is in progress"
+    return 75
+  fi
+  return 0
+}
+
 acquire_operation_lock() {
   if [[ -e "$lock_file" && ( ! -f "$lock_file" || -L "$lock_file" ) ]]; then
     say_error "shvpn: unsafe lock path: $lock_file"
@@ -860,9 +934,22 @@ case "$action" in
     reconnect_ssh "$@"
     exit $?
     ;;
+  add|remove)
+    (( $# == 1 )) || { usage; exit 64; }
+    verify_installed_helper config-helper "$config_helper" || exit $?
+    "$config_helper" "$action" "$1"
+    exit $?
+    ;;
+  uninstall)
+    (( $# == 0 )) || { usage; exit 64; }
+    verify_installed_helper uninstall-helper "$uninstall_helper" || exit $?
+    "$uninstall_helper"
+    exit $?
+    ;;
   start|stop|login)
     (( $# == 0 )) || { usage; exit 64; }
     prepare_runtime || exit $?
+    acquire_config_lock || exit $?
     acquire_operation_lock || exit $?
     case "$action" in
       start) start_vpn ;;

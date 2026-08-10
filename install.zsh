@@ -10,6 +10,7 @@ typeset -gr end_ssh="# <<< shanghaitech-shvpn managed SSH targets <<<"
 typeset -gr begin_path="# >>> shanghaitech-shvpn managed PATH >>>"
 typeset -gr end_path="# <<< shanghaitech-shvpn managed PATH <<<"
 typeset -gr current_uid="$(/usr/bin/id -u)"
+typeset -g config_lock_fd
 
 say_error() {
   print -u2 -r -- "$*"
@@ -57,6 +58,17 @@ ensure_owned_dir() {
   else
     /usr/bin/install -d -m 700 "$dir_path" || die 74 "cannot create directory: $dir_path"
   fi
+}
+
+acquire_config_lock() {
+  local lock_path="$1"
+  if [[ -e "$lock_path" || -L "$lock_path" ]]; then
+    safe_regular_or_absent "$lock_path" || die 69 "unsafe configuration lock: $lock_path"
+  fi
+  /usr/bin/touch "$lock_path" || die 74 "cannot create configuration lock"
+  /bin/chmod 600 "$lock_path" || die 74 "cannot harden configuration lock"
+  zmodload zsh/system || die 69 "zsh/system locking support is unavailable"
+  zsystem flock -t 0 -f config_lock_fd -e "$lock_path" || die 75 "another shvpn configuration or lifecycle operation is in progress"
 }
 
 marker_count() {
@@ -370,6 +382,8 @@ lib_dir="$home_dir/.local/lib/shanghaitech-shvpn"
 baseline_dir="$lib_dir/baseline"
 backup_root="$lib_dir/backups"
 manifest="$lib_dir/install.manifest.tsv"
+config_helper="$lib_dir/configure-targets.zsh"
+uninstall_helper="$lib_dir/uninstall.zsh"
 config_dir="$home_dir/.config/shanghaitech-shvpn"
 targets_file="$config_dir/targets.tsv"
 ssh_dir="$home_dir/.ssh"
@@ -380,18 +394,25 @@ launcher="$bin_dir/shanghaitech-vpn"
 shvpn="$bin_dir/shvpn"
 route="$bin_dir/shanghaitech-ssh-route"
 state_dir="$home_dir/Library/Application Support/ShanghaitechVPN"
+config_lock="$state_dir/shvpn.config.lock"
 TAB=$'\t'
 
-for managed_path in "$client" "$launcher" "$shvpn" "$route" "$targets_file" "$ssh_config" "$zshrc" "$manifest"; do
+for managed_path in "$client" "$launcher" "$shvpn" "$route" "$targets_file" "$ssh_config" "$zshrc" "$manifest" "$config_helper" "$uninstall_helper" "$config_lock"; do
   safe_regular_or_absent "$managed_path" || die 69 "refusing unsafe path: $managed_path"
 done
+
+# Serialize the live preflight, migration, and installation write set with all
+# lifecycle and dynamic-target mutations.
+ensure_private_dir "$state_dir"
+acquire_config_lock "$config_lock"
 
 existing_install=0
 if [[ -f "$manifest" ]]; then
   existing_install=1
   [[ "$(/usr/bin/stat -f %Lp "$manifest")" == "600" ]] || die 69 "install manifest has unsafe mode"
   manifest_get format "$manifest" || die 65 "invalid install manifest"
-  [[ "$REPLY" == "1" ]] || die 65 "unsupported install manifest"
+  install_format="$REPLY"
+  [[ "$install_format" == "1" || "$install_format" == "2" ]] || die 65 "unsupported install manifest"
   manifest_get path-choice "$manifest" || die 65 "invalid install manifest"
   [[ "$REPLY" == "$path_choice" ]] || die 65 "PATH policy changed; run uninstall.zsh before reinstalling"
   for spec in \
@@ -408,6 +429,22 @@ if [[ -f "$manifest" ]]; then
     sha_file "$managed_path" || die 74 "cannot hash managed file: $managed_path"
     [[ "$REPLY" == "$expected_sha" ]] || die 65 "managed file was modified; refusing overwrite: $managed_path"
   done
+  if [[ "$install_format" == "2" ]]; then
+    for spec in \
+      "config-helper:$config_helper" \
+      "uninstall-helper:$uninstall_helper"; do
+      key="${spec%%:*}"
+      managed_path="${spec#*:}"
+      [[ -f "$managed_path" && -x "$managed_path" ]] || die 65 "managed helper is missing: $managed_path"
+      [[ "$(/usr/bin/stat -f %Lp "$managed_path")" == "700" ]] || die 69 "managed helper has unsafe mode: $managed_path"
+      manifest_get "$key" "$manifest" || die 65 "invalid install manifest entry: $key"
+      expected_sha="$REPLY"
+      sha_file "$managed_path" || die 74 "cannot hash managed helper: $managed_path"
+      [[ "$REPLY" == "$expected_sha" ]] || die 65 "managed helper was modified; refusing overwrite: $managed_path"
+    done
+  elif [[ -e "$config_helper" || -L "$config_helper" || -e "$uninstall_helper" || -L "$uninstall_helper" ]]; then
+    die 65 "incomplete format-1 migration detected; run the repository uninstall.zsh, then reinstall"
+  fi
 elif [[ -e "$lib_dir" || -L "$lib_dir" ]]; then
   [[ -d "$lib_dir" && ! -L "$lib_dir" ]] || die 69 "unsafe library directory: $lib_dir"
   die 65 "existing unrecognized installation metadata: $lib_dir"
@@ -431,6 +468,8 @@ rollback_install() {
   restore_snapshot "$history_dir" shanghaitech-vpn "$launcher" || rollback_failed=1
   restore_snapshot "$history_dir" shvpn "$shvpn" || rollback_failed=1
   restore_snapshot "$history_dir" shanghaitech-ssh-route "$route" || rollback_failed=1
+  restore_snapshot "$history_dir" config-helper "$config_helper" || rollback_failed=1
+  restore_snapshot "$history_dir" uninstall-helper "$uninstall_helper" || rollback_failed=1
   restore_snapshot "$history_dir" targets "$targets_file" || rollback_failed=1
   restore_snapshot "$history_dir" ssh-config "$ssh_config" || rollback_failed=1
   restore_snapshot "$history_dir" zshrc "$zshrc" || rollback_failed=1
@@ -471,6 +510,11 @@ quote_for_zsh "$targets_file"; targets_q="$REPLY"
 quote_for_zsh "$route"; route_command_q="$REPLY"
 quote_for_zsh "$route"; route_q="$REPLY"
 quote_for_zsh "$ssh_config"; ssh_config_q="$REPLY"
+quote_for_zsh "$manifest"; manifest_q="$REPLY"
+quote_for_zsh "$config_helper"; config_helper_q="$REPLY"
+quote_for_zsh "$uninstall_helper"; uninstall_helper_q="$REPLY"
+quote_for_zsh "$config_lock"; config_lock_q="$REPLY"
+quote_for_zsh "$backup_root"; backup_root_q="$REPLY"
 route_proxy="$route_command_q %h %p"
 quote_for_zsh "$route_proxy"; route_proxy_q="$REPLY"
 
@@ -489,8 +533,26 @@ content="${content//@@TARGETS_Q@@/$targets_q}"
 content="${content//@@ROUTE_Q@@/$route_q}"
 content="${content//@@ROUTE_PROXY_Q@@/$route_proxy_q}"
 content="${content//@@SSH_CONFIG_Q@@/$ssh_config_q}"
+content="${content//@@MANIFEST_Q@@/$manifest_q}"
+content="${content//@@CONFIG_HELPER_Q@@/$config_helper_q}"
+content="${content//@@UNINSTALL_HELPER_Q@@/$uninstall_helper_q}"
+content="${content//@@CONFIG_LOCK_Q@@/$config_lock_q}"
 [[ "$content" != *'@@'* ]] || die 65 "unresolved shvpn template token"
 print -rn -- "$content" >"$work_dir/shvpn"
+
+content="$(<"$project_root/libexec/shvpn-config.zsh")"
+content="${content//@@TARGETS_Q@@/$targets_q}"
+content="${content//@@ROUTE_Q@@/$route_q}"
+content="${content//@@ROUTE_PROXY_Q@@/$route_proxy_q}"
+content="${content//@@SSH_CONFIG_Q@@/$ssh_config_q}"
+content="${content//@@MANIFEST_Q@@/$manifest_q}"
+content="${content//@@CONFIG_HELPER_Q@@/$config_helper_q}"
+content="${content//@@CONFIG_LOCK_Q@@/$config_lock_q}"
+content="${content//@@BACKUP_ROOT_Q@@/$backup_root_q}"
+[[ "$content" != *'@@'* ]] || die 65 "unresolved configuration helper template token"
+print -rn -- "$content" >"$work_dir/configure-targets.zsh"
+
+/bin/cp "$project_root/uninstall.zsh" "$work_dir/uninstall.zsh" || die 74 "cannot prepare uninstall helper"
 
 content="$(<"$project_root/libexec/shanghaitech-ssh-route.zsh")"
 content="${content//@@SHVPN_Q@@/$shvpn_q}"
@@ -498,8 +560,8 @@ content="${content//@@TARGETS_Q@@/$targets_q}"
 [[ "$content" != *'@@'* ]] || die 65 "unresolved route template token"
 print -rn -- "$content" >"$work_dir/shanghaitech-ssh-route"
 
-/bin/chmod 700 "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route"
-/bin/zsh -n "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route" || die 65 "rendered helper syntax check failed"
+/bin/chmod 700 "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route" "$work_dir/configure-targets.zsh" "$work_dir/uninstall.zsh"
+/bin/zsh -n "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route" "$work_dir/configure-targets.zsh" "$work_dir/uninstall.zsh" || die 65 "rendered helper syntax check failed"
 
 : >"$work_dir/targets.tsv"
 : >"$work_dir/ssh.block"
@@ -635,6 +697,8 @@ snapshot_path "$history_dir" zju-connect "$client"
 snapshot_path "$history_dir" shanghaitech-vpn "$launcher"
 snapshot_path "$history_dir" shvpn "$shvpn"
 snapshot_path "$history_dir" shanghaitech-ssh-route "$route"
+snapshot_path "$history_dir" config-helper "$config_helper"
+snapshot_path "$history_dir" uninstall-helper "$uninstall_helper"
 snapshot_path "$history_dir" targets "$targets_file"
 snapshot_path "$history_dir" ssh-config "$ssh_config"
 snapshot_path "$history_dir" zshrc "$zshrc"
@@ -646,6 +710,8 @@ atomic_install "$work_dir/zju-connect" "$client" 755 || die 74 "cannot install z
 atomic_install "$work_dir/shanghaitech-vpn" "$launcher" 755 || die 74 "cannot install launcher"
 atomic_install "$work_dir/shvpn" "$shvpn" 755 || die 74 "cannot install shvpn"
 atomic_install "$work_dir/shanghaitech-ssh-route" "$route" 755 || die 74 "cannot install route helper"
+atomic_install "$work_dir/configure-targets.zsh" "$config_helper" 700 || die 74 "cannot install configuration helper"
+atomic_install "$work_dir/uninstall.zsh" "$uninstall_helper" 700 || die 74 "cannot install uninstall helper"
 atomic_install "$work_dir/targets.tsv" "$targets_file" 600 || die 74 "cannot install target allowlist"
 atomic_install "$work_dir/ssh.config" "$ssh_config" 600 || die 74 "cannot install SSH config"
 if [[ "$path_choice" == "add" ]]; then
@@ -657,6 +723,8 @@ for spec in \
   "shanghaitech-vpn:$launcher" \
   "shvpn:$shvpn" \
   "shanghaitech-ssh-route:$route" \
+  "config-helper:$config_helper" \
+  "uninstall-helper:$uninstall_helper" \
   "targets:$targets_file"; do
   key="${spec%%:*}"
   managed_path="${spec#*:}"
@@ -666,7 +734,7 @@ done
 sha_file "$work_dir/ssh.block"; ssh_block_sha="$REPLY"
 sha_file "$ssh_config"; ssh_full_sha="$REPLY"
 {
-  print -r -- "format${TAB}1"
+  print -r -- "format${TAB}2"
   print -r -- "path-choice${TAB}$path_choice"
   /bin/cat "$work_dir/install.manifest.tsv"
   print -r -- "ssh-block${TAB}$ssh_block_sha"
@@ -679,6 +747,10 @@ sha_file "$ssh_config"; ssh_full_sha="$REPLY"
   fi
 } >"$work_dir/manifest"
 atomic_install "$work_dir/manifest" "$manifest" 600 || die 74 "cannot install manifest"
+sha_file "$work_dir/manifest" || die 74 "cannot hash manifest candidate"
+manifest_candidate_sha="$REPLY"
+sha_file "$manifest" || die 74 "cannot verify installed manifest"
+[[ "$REPLY" == "$manifest_candidate_sha" ]] || die 74 "installed manifest verification failed"
 
 install_complete=1
 print -r -- "安装完成。新开一个终端后可以使用："
@@ -687,15 +759,21 @@ if [[ "$path_choice" == "add" ]]; then
   print -r -- "  shvpn          # 后台启动"
   print -r -- "  shvpn status"
   print -r -- "  shvpn doctor"
+  print -r -- "  shvpn add HOST_OR_ALIAS"
+  print -r -- "  shvpn remove HOST_OR_ALIAS"
   print -r -- "  shvpn reconnect # 可选：关闭目标服务器的配置型 SSH 复用连接"
   print -r -- "  shvpn stop"
+  print -r -- "  shvpn uninstall"
 else
   print -r -- "  $shvpn login"
   print -r -- "  $shvpn"
   print -r -- "  $shvpn status"
   print -r -- "  $shvpn doctor"
+  print -r -- "  $shvpn add HOST_OR_ALIAS"
+  print -r -- "  $shvpn remove HOST_OR_ALIAS"
   print -r -- "  $shvpn reconnect"
   print -r -- "  $shvpn stop"
+  print -r -- "  $shvpn uninstall"
 fi
 for target_host in "${target_hosts[@]}"; do
   print -r -- "  ssh $target_host"

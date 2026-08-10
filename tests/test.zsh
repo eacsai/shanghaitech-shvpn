@@ -32,6 +32,16 @@ assert_count() {
   [[ "$actual" == "$expected" ]] || fail "$file contains $actual copies of $pattern, expected $expected"
 }
 
+assert_manifest_hash() {
+  local key="$1"
+  local file="$2"
+  local manifest="$3"
+  local expected actual
+  expected="$(/usr/bin/awk -F '\t' -v key="$key" '$1 == key {count++; value=$2} END {if (count != 1) exit 1; print value}' "$manifest")" || fail "manifest key is missing or duplicated: $key"
+  actual="$(/usr/bin/shasum -a 256 "$file" | /usr/bin/awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || fail "manifest hash mismatch for $key"
+}
+
 for script in "$project_root"/*.zsh "$project_root"/libexec/*.zsh "$project_root"/tests/*.zsh; do
   /bin/zsh -n "$script" || fail "zsh syntax failed: $script"
 done
@@ -49,12 +59,18 @@ expected_paths=(
   libexec/build-client.zsh
   libexec/shanghaitech-ssh-route.zsh
   libexec/shanghaitech-vpn.zsh
+  libexec/shvpn-config.zsh
   libexec/shvpn.zsh
   patches/zju-connect-v1.2.2-node-selection.patch
   tests/test.zsh
   uninstall.zsh
 )
-actual_paths=("${(@f)$(/usr/bin/git -C "$project_root" ls-files | LC_ALL=C /usr/bin/sort)}")
+actual_paths=("${(@f)$({
+  /usr/bin/git -C "$project_root" ls-files
+  if [[ -f "$project_root/libexec/shvpn-config.zsh" ]] && ! /usr/bin/git -C "$project_root" ls-files --error-unmatch libexec/shvpn-config.zsh >/dev/null 2>&1; then
+    print -r -- libexec/shvpn-config.zsh
+  fi
+} | LC_ALL=C /usr/bin/sort)}")
 [[ "${(j:\n:)actual_paths}" == "${(j:\n:)expected_paths}" ]] || {
   print -u2 -r -- "Expected manifest:"
   print -u2 -l -- "${expected_paths[@]}"
@@ -63,6 +79,22 @@ actual_paths=("${(@f)$(/usr/bin/git -C "$project_root" ls-files | LC_ALL=C /usr/
   fail "repository path manifest differs"
 }
 tracked_files=("${(@)^actual_paths/#/$project_root/}")
+
+[[ "$(/usr/bin/grep -Fxc '|---|---|' "$project_root/README.md")" == 1 ]] || fail "README must contain exactly one command table"
+[[ "$(/usr/bin/grep -Ec '^\| `shvpn([^`]*)?` \|' "$project_root/README.md")" == 10 ]] || fail "README command table must list exactly ten shvpn command forms"
+for documented_command in \
+  '`shvpn`' \
+  '`shvpn start`' \
+  '`shvpn login`' \
+  '`shvpn status`' \
+  '`shvpn stop`' \
+  '`shvpn add HOST_OR_ALIAS`' \
+  '`shvpn remove HOST_OR_ALIAS`' \
+  '`shvpn doctor [ALIAS ...]`' \
+  '`shvpn reconnect [ALIAS ...]`' \
+  '`shvpn uninstall`'; do
+  /usr/bin/grep -F "| $documented_command |" "$project_root/README.md" >/dev/null || fail "README command table is missing $documented_command"
+done
 
 for forbidden in \
   '/Use''rs/' \
@@ -100,6 +132,7 @@ lifecycle_started=0
 unrelated_listener_pid=""
 lock_login_pid=""
 lock_client_pid=""
+config_lock_holder_pid=""
 cleanup() {
   if [[ "${lock_client_pid:-}" == <-> ]] && /bin/kill -0 "$lock_client_pid" 2>/dev/null; then
     /bin/kill -INT "$lock_client_pid" 2>/dev/null || true
@@ -107,6 +140,10 @@ cleanup() {
   if [[ "${lock_login_pid:-}" == <-> ]] && /bin/kill -0 "$lock_login_pid" 2>/dev/null; then
     /bin/kill -INT "$lock_login_pid" 2>/dev/null || true
     wait "$lock_login_pid" 2>/dev/null || true
+  fi
+  if [[ "${config_lock_holder_pid:-}" == <-> ]] && /bin/kill -0 "$config_lock_holder_pid" 2>/dev/null; then
+    /bin/kill -TERM "$config_lock_holder_pid" 2>/dev/null || true
+    wait "$config_lock_holder_pid" 2>/dev/null || true
   fi
   if (( ${lifecycle_started:-0} )) && [[ -x "${fixture_home:-}/.local/bin/shvpn" ]]; then
     HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" stop >/dev/null 2>&1 || true
@@ -155,12 +192,18 @@ print -r -- '    User alias-user' >>"$fixture_home/.ssh/config"
 print -r -- '    Port 2201' >>"$fixture_home/.ssh/config"
 print -r -- '    ControlMaster auto' >>"$fixture_home/.ssh/config"
 print -r -- '    ControlPath ~/.ssh/cm-%C' >>"$fixture_home/.ssh/config"
+print -r -- 'Host gpu-add' >>"$fixture_home/.ssh/config"
+print -r -- '    HostName 192.0.2.40' >>"$fixture_home/.ssh/config"
 print -r -- 'Host gpu-include' >"$fixture_home/.ssh/conf.d/gpu.conf"
 print -r -- '    HostName 192.0.2.20' >>"$fixture_home/.ssh/conf.d/gpu.conf"
 print -r -- '    User include-user' >>"$fixture_home/.ssh/conf.d/gpu.conf"
 print -r -- '    Port 2202' >>"$fixture_home/.ssh/conf.d/gpu.conf"
 print -r -- '    ControlMaster auto' >>"$fixture_home/.ssh/conf.d/gpu.conf"
 print -r -- '    ControlPath ~/.ssh/cm-%C' >>"$fixture_home/.ssh/conf.d/gpu.conf"
+print -r -- 'Host gpu-include-add' >>"$fixture_home/.ssh/conf.d/gpu.conf"
+print -r -- '    HostName 192.0.2.60' >>"$fixture_home/.ssh/conf.d/gpu.conf"
+print -r -- '    User include-add-user' >>"$fixture_home/.ssh/conf.d/gpu.conf"
+print -r -- '    Port 2260' >>"$fixture_home/.ssh/conf.d/gpu.conf"
 print -r -- '# existing zsh content' >"$fixture_home/.zshrc"
 /usr/bin/install -d -m 700 "$fixture_home/.local/bin"
 print -r -- '#!/bin/zsh' >"$fixture_home/.local/bin/zju-connect"
@@ -249,6 +292,9 @@ if [[ "$warning_doctor_rc" != 1 ]]; then
   /bin/cat "$test_tmp/warning-doctor.out" "$test_tmp/warning-doctor.err" >&2
   fail "doctor incomplete include warning returned $warning_doctor_rc instead of 1"
 fi
+HOME="$warning_home" "$warning_home/.local/bin/shvpn" add outside-only >"$test_tmp/warning-add.out" 2>"$test_tmp/warning-add.err" || fail "add did not continue after incomplete Include discovery"
+/usr/bin/grep -F 'SSH alias discovery was incomplete because of Include, safety, or scan limits' "$test_tmp/warning-add.err" >/dev/null || fail "add incomplete Include warning missing"
+/usr/bin/grep -Fx '192.0.2.90' "$warning_home/.config/shanghaitech-shvpn/targets.tsv" >/dev/null || fail "add did not resolve the explicit outside Include alias"
 HOME="$warning_home" PATH="$fixture_path" "$fixture_repo/uninstall.zsh" >/dev/null
 
 HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive \
@@ -262,6 +308,9 @@ for executable in zju-connect shanghaitech-vpn shvpn shanghaitech-ssh-route; do
 done
 assert_file_mode 600 "$fixture_home/.config/shanghaitech-shvpn/targets.tsv"
 assert_file_mode 600 "$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv"
+assert_file_mode 700 "$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh"
+assert_file_mode 700 "$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh"
+/usr/bin/grep -Fx $'format\t2' "$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv" >/dev/null || fail "fresh install did not write manifest format 2"
 assert_count 1 "$begin_ssh" "$fixture_home/.ssh/config"
 assert_count 1 "$begin_path" "$fixture_home/.zshrc"
 
@@ -274,8 +323,12 @@ assert_count 1 'Match final host 192.0.2.10,192.0.2.20' "$fixture_home/.ssh/conf
 assert_count 0 'Host 192.0.2.10' "$fixture_home/.ssh/config"
 assert_count 0 'Host 192.0.2.20' "$fixture_home/.ssh/config"
 
-for rendered in shanghaitech-vpn shvpn shanghaitech-ssh-route; do
-  if /usr/bin/grep -F '@@' "$fixture_home/.local/bin/$rendered" >/dev/null 2>&1; then
+for rendered in \
+  "$fixture_home/.local/bin/shanghaitech-vpn" \
+  "$fixture_home/.local/bin/shvpn" \
+  "$fixture_home/.local/bin/shanghaitech-ssh-route" \
+  "$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh"; do
+  if /usr/bin/grep -F '@@' "$rendered" >/dev/null 2>&1; then
     fail "unresolved template token in $rendered"
   fi
 done
@@ -285,6 +338,205 @@ done
 
 route_path="$fixture_home/.local/bin/shanghaitech-ssh-route"
 route_q="${(qqq)route_path}"
+fixture_manifest="$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv"
+fixture_config_helper="$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh"
+fixture_uninstall_helper="$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh"
+for helper_spec in "config-helper:$fixture_config_helper" "uninstall-helper:$fixture_uninstall_helper"; do
+  assert_manifest_hash "${helper_spec%%:*}" "${helper_spec#*:}" "$fixture_manifest"
+done
+
+# Duplicate add is a byte-for-byte no-op, including when an alias resolves to
+# an already-managed final HostName.
+for state_file in targets ssh manifest; do
+  case "$state_file" in
+    targets) source_file="$fixture_home/.config/shanghaitech-shvpn/targets.tsv" ;;
+    ssh) source_file="$fixture_home/.ssh/config" ;;
+    manifest) source_file="$fixture_manifest" ;;
+  esac
+  /bin/cp -p "$source_file" "$test_tmp/noop-$state_file"
+done
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add gpu-main >/dev/null || fail "alias-to-existing add no-op failed"
+/usr/bin/cmp -s "$test_tmp/noop-targets" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "duplicate add changed targets"
+/usr/bin/cmp -s "$test_tmp/noop-ssh" "$fixture_home/.ssh/config" || fail "duplicate add changed SSH config"
+/usr/bin/cmp -s "$test_tmp/noop-manifest" "$fixture_manifest" || fail "duplicate add changed manifest"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add 192.0.2.10 >/dev/null || fail "direct repeated add no-op failed"
+/usr/bin/cmp -s "$test_tmp/noop-targets" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "direct repeated add changed targets"
+/usr/bin/cmp -s "$test_tmp/noop-ssh" "$fixture_home/.ssh/config" || fail "direct repeated add changed SSH config"
+/usr/bin/cmp -s "$test_tmp/noop-manifest" "$fixture_manifest" || fail "direct repeated add changed manifest"
+
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add gpu-add >"$test_tmp/alias-add.out" || fail "alias add failed"
+/usr/bin/grep -F 'gpu-add -> 192.0.2.40' "$test_tmp/alias-add.out" >/dev/null || fail "alias add output omitted the resolved target mapping"
+{
+  print -r -- '192.0.2.10'
+  print -r -- '192.0.2.20'
+  print -r -- '192.0.2.40'
+} >"$test_tmp/expected-targets-added.tsv"
+/usr/bin/cmp -s "$test_tmp/expected-targets-added.tsv" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "alias add did not append the resolved HostName"
+assert_count 1 'Match final host 192.0.2.10,192.0.2.20,192.0.2.40' "$fixture_home/.ssh/config"
+assert_manifest_hash targets "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" "$fixture_manifest"
+assert_manifest_hash ssh-full "$fixture_home/.ssh/config" "$fixture_manifest"
+/usr/bin/awk -v begin="$begin_ssh" -v end="$end_ssh" '
+  $0 == begin { inside=1 }
+  inside { print }
+  $0 == end { inside=0 }
+' "$fixture_home/.ssh/config" >"$test_tmp/add-managed-ssh.block"
+assert_manifest_hash ssh-block "$test_tmp/add-managed-ssh.block" "$fixture_manifest"
+
+print -r -- '# user edit preserved across shvpn target updates' >>"$fixture_home/.ssh/config"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" remove gpu-add >"$test_tmp/alias-remove.out" || fail "alias remove failed"
+/usr/bin/grep -F 'gpu-add -> 192.0.2.40' "$test_tmp/alias-remove.out" >/dev/null || fail "alias remove output omitted the resolved target mapping"
+/usr/bin/grep -F 'aliases sharing this HostName no longer receive the managed route' "$test_tmp/alias-remove.out" >/dev/null || fail "alias remove output omitted shared-target semantics"
+/usr/bin/grep -Fx '# user edit preserved across shvpn target updates' "$fixture_home/.ssh/config" >/dev/null || fail "target update discarded SSH config outside the managed block"
+/usr/bin/cmp -s "$test_tmp/expected-targets.tsv" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "alias remove did not remove its resolved target"
+
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add gpu-include-add >/dev/null || fail "safe-Include alias add failed"
+include_add_output="$(HOME="$fixture_home" /usr/bin/ssh -F "$fixture_home/.ssh/config" -G gpu-include-add 2>/dev/null)"
+[[ "$(print -r -- "$include_add_output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')" == "192.0.2.60" ]] || fail "safe-Include add hostname mismatch"
+[[ "$(print -r -- "$include_add_output" | /usr/bin/awk '$1 == "user" {print $2; exit}')" == "include-add-user" ]] || fail "safe-Include add did not preserve User"
+[[ "$(print -r -- "$include_add_output" | /usr/bin/awk '$1 == "port" {print $2; exit}')" == "2260" ]] || fail "safe-Include add did not preserve Port"
+[[ "$(print -r -- "$include_add_output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')" == "$route_q %h %p" ]] || fail "safe-Include add did not install the managed route"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" remove gpu-include-add >/dev/null || fail "safe-Include alias remove failed"
+
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add 192.0.2.40 >/dev/null || fail "direct target add failed"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" remove 192.0.2.40 >/dev/null || fail "direct target remove failed"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" remove gpu-include >/dev/null || fail "included alias remove failed"
+print -r -- '192.0.2.10' >"$test_tmp/expected-one-target.tsv"
+/usr/bin/cmp -s "$test_tmp/expected-one-target.tsv" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "alias remove did not remove the shared underlying target"
+/bin/cp -p "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" "$test_tmp/last-remove-targets"
+/bin/cp -p "$fixture_home/.ssh/config" "$test_tmp/last-remove-ssh"
+/bin/cp -p "$fixture_manifest" "$test_tmp/last-remove-manifest"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" remove 192.0.2.10 >"$test_tmp/last-remove.out" 2>"$test_tmp/last-remove.err"
+last_remove_rc=$?
+set -e
+[[ "$last_remove_rc" == 64 ]] || fail "last-target removal returned $last_remove_rc instead of 64"
+/usr/bin/grep -F "use 'shvpn uninstall'" "$test_tmp/last-remove.err" >/dev/null || fail "last-target removal did not recommend uninstall"
+/usr/bin/cmp -s "$test_tmp/last-remove-targets" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "failed last-target removal changed targets"
+/usr/bin/cmp -s "$test_tmp/last-remove-ssh" "$fixture_home/.ssh/config" || fail "failed last-target removal changed SSH config"
+/usr/bin/cmp -s "$test_tmp/last-remove-manifest" "$fixture_manifest" || fail "failed last-target removal changed manifest"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add 192.0.2.20 >/dev/null || fail "direct add did not restore the removed target"
+
+# A discovered alias with an earlier ProxyJump must fail before writes.
+/bin/cp -p "$fixture_home/.ssh/config" "$test_tmp/pre-conflict-ssh"
+/bin/cp -p "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" "$test_tmp/pre-conflict-targets"
+/bin/cp -p "$fixture_manifest" "$test_tmp/pre-conflict-manifest"
+print -r -- 'Host add-conflict' >>"$fixture_home/.ssh/config"
+print -r -- '    HostName 192.0.2.50' >>"$fixture_home/.ssh/config"
+print -r -- '    ProxyJump jump.example.test' >>"$fixture_home/.ssh/config"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add add-conflict >"$test_tmp/add-conflict.out" 2>"$test_tmp/add-conflict.err"
+add_conflict_rc=$?
+set -e
+[[ "$add_conflict_rc" == 2 ]] || fail "dynamic ProxyJump conflict returned $add_conflict_rc instead of 2"
+/usr/bin/grep -F 'earlier ProxyCommand or ProxyJump' "$test_tmp/add-conflict.err" >/dev/null || fail "dynamic ProxyJump conflict message missing"
+/usr/bin/cmp -s "$test_tmp/pre-conflict-targets" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "failed conflict add changed targets"
+/usr/bin/cmp -s "$test_tmp/pre-conflict-manifest" "$fixture_manifest" || fail "failed conflict add changed manifest"
+/usr/bin/install -m 600 "$test_tmp/pre-conflict-ssh" "$fixture_home/.ssh/config"
+
+# The lock is owned by the mutator itself; both helper writes and lifecycle
+# operations fail immediately with 75 while another mutator holds it.
+config_lock_path="$fixture_home/Library/Application Support/ShanghaitechVPN/shvpn.config.lock"
+config_lock_ready="$test_tmp/config-lock.ready"
+{
+  print -r -- '#!/bin/zsh'
+  print -r -- 'set -eu'
+  print -r -- 'zmodload zsh/system'
+  print -r -- 'typeset -g held_fd'
+  print -r -- 'zsystem flock -f held_fd -e "$1"'
+  print -r -- 'print -r -- ready >"$2"'
+  print -r -- '/bin/sleep 30'
+} >"$test_tmp/hold-config-lock.zsh"
+/bin/chmod 700 "$test_tmp/hold-config-lock.zsh"
+"$test_tmp/hold-config-lock.zsh" "$config_lock_path" "$config_lock_ready" &
+config_lock_holder_pid=$!
+for (( i = 0; i < 100; i++ )); do
+  [[ -f "$config_lock_ready" ]] && break
+  /bin/sleep 0.02
+done
+[[ -f "$config_lock_ready" ]] || fail "configuration lock holder did not become ready"
+for contended_command in "add gpu-add" "start"; do
+  set +e
+  HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" ${(z)contended_command} >/dev/null 2>"$test_tmp/config-contended.err"
+  contended_config_rc=$?
+  set -e
+  [[ "$contended_config_rc" == 75 ]] || fail "configuration lock contention returned $contended_config_rc for $contended_command"
+  /usr/bin/grep -F 'another shvpn configuration or lifecycle operation is in progress' "$test_tmp/config-contended.err" >/dev/null || fail "configuration lock contention message missing"
+done
+set +e
+HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive --target 192.0.2.10 --target 192.0.2.20 --add-path >/dev/null 2>"$test_tmp/install-contended.err"
+contended_install_rc=$?
+set -e
+[[ "$contended_install_rc" == 75 ]] || fail "installer configuration lock contention returned $contended_install_rc instead of 75"
+/usr/bin/grep -F 'another shvpn configuration or lifecycle operation is in progress' "$test_tmp/install-contended.err" >/dev/null || fail "installer configuration lock contention message missing"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" uninstall >/dev/null 2>"$test_tmp/uninstall-contended.err"
+contended_uninstall_rc=$?
+set -e
+[[ "$contended_uninstall_rc" == 75 ]] || fail "uninstaller configuration lock contention returned $contended_uninstall_rc instead of 75"
+[[ -x "$fixture_home/.local/bin/shvpn" && -f "$fixture_manifest" ]] || fail "contended uninstall changed the installation"
+/bin/kill -TERM "$config_lock_holder_pid"
+wait "$config_lock_holder_pid" 2>/dev/null || true
+config_lock_holder_pid=""
+
+# Make the allowlist directory read-only after preflight. The SSH file write
+# succeeds first, the allowlist write fails, and the caught error must restore
+# the SSH file from the persistent pre-change backup.
+/bin/cp -p "$fixture_home/.ssh/config" "$test_tmp/rollback-ssh"
+/bin/cp -p "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" "$test_tmp/rollback-targets"
+/bin/cp -p "$fixture_manifest" "$test_tmp/rollback-manifest"
+/bin/chmod 500 "$fixture_home/.config/shanghaitech-shvpn"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add gpu-add >"$test_tmp/rollback-add.out" 2>"$test_tmp/rollback-add.err"
+rollback_add_rc=$?
+set -e
+/bin/chmod 700 "$fixture_home/.config/shanghaitech-shvpn"
+[[ "$rollback_add_rc" == 74 ]] || fail "forced target write failure returned $rollback_add_rc instead of 74"
+/usr/bin/cmp -s "$test_tmp/rollback-ssh" "$fixture_home/.ssh/config" || fail "caught target write failure did not roll back SSH config"
+/usr/bin/cmp -s "$test_tmp/rollback-targets" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "caught target write failure changed targets"
+/usr/bin/cmp -s "$test_tmp/rollback-manifest" "$fixture_manifest" || fail "caught target write failure changed manifest"
+
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add 'bad*' >/dev/null 2>&1
+invalid_add_rc=$?
+set -e
+[[ "$invalid_add_rc" == 64 ]] || fail "invalid dynamic target returned $invalid_add_rc instead of 64"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" remove keep >/dev/null 2>&1
+unmanaged_remove_rc=$?
+set -e
+[[ "$unmanaged_remove_rc" == 64 ]] || fail "unmanaged removal returned $unmanaged_remove_rc instead of 64"
+
+/bin/cp -p "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" "$test_tmp/tampered-targets"
+print -r -- '192.0.2.30' >>"$fixture_home/.config/shanghaitech-shvpn/targets.tsv"
+/bin/cp -p "$fixture_home/.ssh/config" "$test_tmp/pre-tamper-add-ssh"
+/bin/cp -p "$fixture_manifest" "$test_tmp/pre-tamper-add-manifest"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add gpu-add >/dev/null 2>&1
+tampered_add_rc=$?
+set -e
+[[ "$tampered_add_rc" == 2 ]] || fail "modified targets add returned $tampered_add_rc instead of 2"
+/usr/bin/cmp -s "$test_tmp/pre-tamper-add-ssh" "$fixture_home/.ssh/config" || fail "modified targets rejection changed SSH config"
+/usr/bin/cmp -s "$test_tmp/pre-tamper-add-manifest" "$fixture_manifest" || fail "modified targets rejection changed manifest"
+/usr/bin/install -m 600 "$test_tmp/tampered-targets" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv"
+
+/bin/cp -p "$fixture_manifest" "$test_tmp/valid-dynamic-manifest"
+/usr/bin/awk -F '\t' '$1 != "config-helper" {print}' "$fixture_manifest" >"$test_tmp/missing-helper-manifest"
+/usr/bin/install -m 600 "$test_tmp/missing-helper-manifest" "$fixture_manifest"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" add gpu-add >/dev/null 2>&1
+missing_manifest_rc=$?
+set -e
+[[ "$missing_manifest_rc" == 65 ]] || fail "missing helper manifest key returned $missing_manifest_rc instead of 65"
+/usr/bin/install -m 600 "$test_tmp/valid-dynamic-manifest" "$fixture_manifest"
+assert_manifest_hash config-helper "$fixture_config_helper" "$fixture_manifest"
+assert_manifest_hash uninstall-helper "$fixture_uninstall_helper" "$fixture_manifest"
+assert_manifest_hash targets "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" "$fixture_manifest"
+
+# Remove the fixture-only outside-block edit so later uninstall can compare the
+# restored baseline exactly. The managed block remains untouched.
+/usr/bin/grep -Fvx '# user edit preserved across shvpn target updates' "$fixture_home/.ssh/config" >"$test_tmp/ssh-without-user-comment"
+/usr/bin/install -m 600 "$test_tmp/ssh-without-user-comment" "$fixture_home/.ssh/config"
+
 ssh_output="$(/usr/bin/ssh -F "$fixture_home/.ssh/config" -G 192.0.2.10 2>/dev/null)"
 [[ "$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')" == "192.0.2.10" ]] || fail "ssh hostname mismatch"
 [[ "$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "port" {print $2; exit}')" == "22" ]] || fail "ssh port mismatch"
@@ -344,7 +596,7 @@ set -e
 [[ "$doctor_unsafe_rc" == 2 ]] || fail "doctor unsafe target mode returned $doctor_unsafe_rc instead of 2"
 /bin/chmod 600 "$fixture_home/.config/shanghaitech-shvpn/targets.tsv"
 
-for old_arity in "start extra" "stop extra" "status extra" "login extra"; do
+for old_arity in "start extra" "stop extra" "status extra" "login extra" "add" "add one two" "remove" "remove one two" "uninstall extra"; do
   set +e
   HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" ${(z)old_arity} >/dev/null 2>&1
   old_arity_rc=$?
@@ -472,7 +724,7 @@ if [[ "${SHVPN_RUN_UPSTREAM:-0}" == "1" ]]; then
   contended_rc=$?
   set -e
   [[ "$contended_rc" == 75 ]] || fail "operation lock contention returned $contended_rc instead of 75"
-  /usr/bin/grep -F 'another start, stop, or login operation is in progress' "$test_tmp/contended-stop.err" >/dev/null || fail "operation lock contention message missing"
+  /usr/bin/grep -F 'another shvpn configuration or lifecycle operation is in progress' "$test_tmp/contended-stop.err" >/dev/null || fail "lifecycle configuration lock contention message missing"
   /bin/kill -INT "$lock_client_pid"
   wait "$lock_login_pid" || fail "foreground login did not exit cleanly after fixture SIGINT"
   lock_client_pid=""
@@ -522,12 +774,15 @@ legacy_ssh_full_sha="$(/usr/bin/shasum -a 256 "$test_tmp/legacy-ssh.config" | /u
 manifest_path="$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv"
 /usr/bin/awk -F '\t' -v OFS='\t' \
   -v targets="$legacy_targets_sha" -v block="$legacy_ssh_block_sha" -v full="$legacy_ssh_full_sha" '
+    $1 == "format" { $2="1" }
+    $1 == "config-helper" || $1 == "uninstall-helper" { next }
     $1 == "targets" { $2=targets }
     $1 == "ssh-block" { $2=block }
     $1 == "ssh-full" { $2=full }
     { print }
   ' "$manifest_path" >"$test_tmp/legacy-manifest.tsv"
 /usr/bin/install -m 600 "$test_tmp/legacy-manifest.tsv" "$manifest_path"
+/bin/rm -f -- "$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh" "$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh"
 
 legacy_backup_count="$(/usr/bin/find "$fixture_home/.local/lib/shanghaitech-shvpn/backups" -mindepth 1 -maxdepth 1 -type d | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
 HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive \
@@ -540,6 +795,9 @@ post_migration_backup_count="$(/usr/bin/find "$fixture_home/.local/lib/shanghait
 assert_count 0 'Host gpu' "$fixture_home/.ssh/config"
 assert_count 0 'Host 192.0.2.10' "$fixture_home/.ssh/config"
 assert_count 1 'Match final host 192.0.2.10,192.0.2.20' "$fixture_home/.ssh/config"
+/usr/bin/grep -Fx $'format\t2' "$manifest_path" >/dev/null || fail "legacy migration did not write manifest format 2"
+assert_manifest_hash config-helper "$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh" "$manifest_path"
+assert_manifest_hash uninstall-helper "$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh" "$manifest_path"
 /usr/bin/awk -v begin="$begin_ssh" -v end="$end_ssh" '
   $0 == begin { inside=1 }
   inside { print }
@@ -584,7 +842,7 @@ for (( i = 0; i < 40; i++ )); do
   /bin/sleep 0.05
 done
 (( listener_ready )) || fail "unrelated fixture listener did not start"
-HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/uninstall.zsh" >"$test_tmp/uninstall.out" 2>"$test_tmp/uninstall.err"
+HOME="$fixture_home" PATH="$fixture_path" "$fixture_home/.local/bin/shvpn" uninstall >"$test_tmp/uninstall.out" 2>"$test_tmp/uninstall.err"
 /bin/kill -0 "$unrelated_listener_pid" 2>/dev/null || fail "uninstall stopped an unrelated listener"
 /usr/bin/grep -F 'leaving that process untouched and continuing' "$test_tmp/uninstall.err" >/dev/null || fail "uninstall did not warn about the unrelated listener"
 /bin/kill -TERM "$unrelated_listener_pid"
@@ -604,6 +862,28 @@ HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/uninstall.zsh" >/dev/nu
 /usr/bin/cmp -s "$test_tmp/original-ssh-config" "$fixture_home/.ssh/config" || fail "reinstall cycle did not restore SSH config"
 /usr/bin/cmp -s "$test_tmp/original-zju-connect" "$fixture_home/.local/bin/zju-connect" || fail "reinstall cycle did not restore zju-connect"
 [[ ! -e "$fixture_home/.local/lib/shanghaitech-shvpn" ]] || fail "active metadata namespace remains after reinstall cycle"
+
+interrupted_home="$test_tmp/Interrupted Migration Home"
+/usr/bin/install -d -m 700 "$interrupted_home/.ssh"
+print -r -- 'Host keep' >"$interrupted_home/.ssh/config"
+print -r -- '    HostName 192.0.2.30' >>"$interrupted_home/.ssh/config"
+print -r -- '# interrupted fixture' >"$interrupted_home/.zshrc"
+HOME="$interrupted_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive --target 192.0.2.40 --no-path >/dev/null
+interrupted_manifest="$interrupted_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv"
+/usr/bin/awk -F '\t' -v OFS='\t' '
+  $1 == "format" { $2="1" }
+  $1 == "config-helper" || $1 == "uninstall-helper" { next }
+  { print }
+' "$interrupted_manifest" >"$test_tmp/interrupted-format1-manifest"
+/usr/bin/install -m 600 "$test_tmp/interrupted-format1-manifest" "$interrupted_manifest"
+set +e
+HOME="$interrupted_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive --target 192.0.2.40 --no-path >"$test_tmp/interrupted-install.out" 2>"$test_tmp/interrupted-install.err"
+interrupted_install_rc=$?
+set -e
+[[ "$interrupted_install_rc" == 65 ]] || fail "interrupted format-1 migration returned $interrupted_install_rc instead of 65"
+/usr/bin/grep -F 'incomplete format-1 migration detected' "$test_tmp/interrupted-install.err" >/dev/null || fail "interrupted migration recovery message missing"
+HOME="$interrupted_home" PATH="$fixture_path" "$fixture_repo/uninstall.zsh" >/dev/null || fail "standalone uninstall could not recover interrupted format-1 migration"
+[[ ! -e "$interrupted_home/.local/lib/shanghaitech-shvpn" ]] || fail "standalone recovery left active metadata"
 
 print -rn -- $'192.0.2.40\n\n' | HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --no-path >/dev/null
 assert_count 0 "$begin_path" "$fixture_home/.zshrc"
