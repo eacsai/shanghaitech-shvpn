@@ -1,12 +1,19 @@
 #!/bin/zsh
 
 set -u
+setopt extendedglob
 umask 077
 
 typeset -gr client=@@CLIENT_Q@@
 typeset -gr launcher=@@LAUNCHER_Q@@
 typeset -gr self=@@SHVPN_Q@@
 typeset -gr state_dir=@@STATE_DIR_Q@@
+typeset -gr targets_file=@@TARGETS_Q@@
+typeset -gr route=@@ROUTE_Q@@
+typeset -gr expected_route_proxy=@@ROUTE_PROXY_Q@@
+typeset -gr ssh_config=@@SSH_CONFIG_Q@@
+typeset -gr ssh_root="${ssh_config:h}"
+typeset -gr ssh_client="/usr/bin/ssh"
 typeset -gr client_data="$state_dir/client-data.json"
 typeset -gr log_file="$state_dir/shvpn.log"
 typeset -gr lock_file="$state_dir/shvpn.operation.lock"
@@ -25,6 +32,401 @@ say_error() {
 
 usage() {
   print -u2 -r -- "usage: shvpn [start|stop|status|login]"
+  print -u2 -r -- "   or: shvpn doctor [SSH_NAME ...]"
+  print -u2 -r -- "   or: shvpn reconnect [SSH_NAME ...]"
+}
+
+typeset -ga target_hosts discovered_ssh_names candidate_ssh_names
+typeset -gA target_set explicit_name_set
+typeset -g alias_scan_incomplete=0
+typeset -g resolved_host=""
+typeset -g resolved_proxy=""
+
+safe_owned_regular() {
+  local file_path="$1"
+  [[ -f "$file_path" && ! -L "$file_path" ]] || return 1
+  [[ "$(/usr/bin/stat -f %u "$file_path" 2>/dev/null)" == "$current_uid" ]]
+}
+
+safe_owned_executable() {
+  safe_owned_regular "$1" && [[ -x "$1" ]]
+}
+
+validate_ssh_name() {
+  [[ "$1" == [A-Za-z0-9][A-Za-z0-9._-]# ]]
+}
+
+load_targets() {
+  local line owner mode
+  target_hosts=()
+  target_set=()
+
+  if ! safe_owned_regular "$targets_file"; then
+    say_error "shvpn: target allowlist is missing or unsafe"
+    return 2
+  fi
+  owner="$(/usr/bin/stat -f %u "$targets_file" 2>/dev/null)" || return 2
+  mode="$(/usr/bin/stat -f %Lp "$targets_file" 2>/dev/null)" || return 2
+  if [[ "$owner" != "$current_uid" || "$mode" != "600" ]]; then
+    say_error "shvpn: target allowlist ownership or mode is unsafe"
+    return 2
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" != [A-Za-z0-9][A-Za-z0-9.-]# || -n "${target_set[$line]:-}" ]]; then
+      say_error "shvpn: target allowlist is malformed"
+      return 2
+    fi
+    target_set[$line]=1
+    target_hosts+=("$line")
+  done <"$targets_file"
+  if (( ${#target_hosts} == 0 )); then
+    say_error "shvpn: target allowlist is empty"
+    return 2
+  fi
+  return 0
+}
+
+mark_alias_scan_incomplete() {
+  alias_scan_incomplete=1
+}
+
+collect_literal_ssh_names() {
+  local root_config="$1"
+  local config_file physical_file line first_word keyword first_arg word value
+  local include_arg include_pattern include_match physical_match
+  local queue_index=1
+  local depth next_depth
+  local -a file_queue depth_queue words directive_args include_matches
+  local -A seen_files seen_names
+
+  discovered_ssh_names=()
+  alias_scan_incomplete=0
+  file_queue=("$root_config")
+  depth_queue=(0)
+
+  while (( queue_index <= ${#file_queue} )); do
+    config_file="${file_queue[$queue_index]}"
+    depth="${depth_queue[$queue_index]}"
+    queue_index=$(( queue_index + 1 ))
+    physical_file="${config_file:A}"
+    [[ -z "${seen_files[$physical_file]:-}" ]] || continue
+    seen_files[$physical_file]=1
+
+    if ! safe_owned_regular "$config_file" || [[ "$physical_file" != "$ssh_root"/* ]]; then
+      mark_alias_scan_incomplete
+      continue
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      words=("${(z)line}")
+      (( ${#words} > 0 )) || continue
+      first_word="${(Q)words[1]}"
+      [[ "$first_word" != \#* ]] || continue
+      directive_args=()
+      if [[ "$first_word" == *=* ]]; then
+        keyword="${${first_word%%=*}:l}"
+        first_arg="${first_word#*=}"
+        [[ -n "$first_arg" ]] && directive_args+=("$first_arg")
+      else
+        keyword="${first_word:l}"
+      fi
+      for word in "${words[@]:1}"; do
+        value="${(Q)word}"
+        [[ "$value" != \#* ]] || break
+        directive_args+=("$value")
+      done
+
+      case "$keyword" in
+        host)
+          for value in "${directive_args[@]}"; do
+            if validate_ssh_name "$value"; then
+              if [[ -z "${seen_names[$value]:-}" ]]; then
+                if (( ${#discovered_ssh_names} >= 4096 )); then
+                  mark_alias_scan_incomplete
+                  break
+                fi
+                seen_names[$value]=1
+                discovered_ssh_names+=("$value")
+              fi
+            fi
+          done
+          ;;
+        include)
+          if (( depth >= 8 )); then
+            (( ${#directive_args} == 0 )) || mark_alias_scan_incomplete
+            continue
+          fi
+          for include_arg in "${directive_args[@]}"; do
+            if [[ -z "$include_arg" || "$include_arg" == *[$'\n\r\t'\|\;\<\>\`\$\(\)\{\}]* ]]; then
+              mark_alias_scan_incomplete
+              continue
+            fi
+            case "$include_arg" in
+              /*) include_pattern="$include_arg" ;;
+              '~/'*) include_pattern="$HOME/${include_arg#\~/}" ;;
+              *) include_pattern="$ssh_root/$include_arg" ;;
+            esac
+            if [[ "$include_pattern" != "$ssh_root"/* || "/$include_pattern/" == */../* ]]; then
+              mark_alias_scan_incomplete
+              continue
+            fi
+            include_matches=( ${~include_pattern}(N) )
+            for include_match in "${include_matches[@]}"; do
+              physical_match="${include_match:A}"
+              if ! safe_owned_regular "$include_match" || [[ "$physical_match" != "$ssh_root"/* ]]; then
+                mark_alias_scan_incomplete
+                continue
+              fi
+              [[ -z "${seen_files[$physical_match]:-}" ]] || continue
+              if (( ${#file_queue} >= 64 )); then
+                mark_alias_scan_incomplete
+                continue
+              fi
+              next_depth=$(( depth + 1 ))
+              file_queue+=("$include_match")
+              depth_queue+=("$next_depth")
+            done
+          done
+          ;;
+      esac
+    done <"$config_file"
+  done
+}
+
+resolve_ssh_name() {
+  local ssh_name="$1"
+  local output
+  resolved_host=""
+  resolved_proxy=""
+  output="$($ssh_client -F "$ssh_config" -G -- "$ssh_name" 2>/dev/null)" || return 1
+  resolved_host="$(print -r -- "$output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')"
+  resolved_proxy="$(print -r -- "$output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')"
+  [[ -n "$resolved_host" ]]
+}
+
+prepare_ssh_diagnostics() {
+  local file_path mode permission
+
+  for file_path in "$client" "$launcher" "$self" "$route"; do
+    if ! safe_owned_executable "$file_path"; then
+      say_error "shvpn: managed executable is missing or unsafe: $file_path"
+      return 2
+    fi
+  done
+  if ! safe_owned_regular "$ssh_config"; then
+    say_error "shvpn: SSH config is missing or unsafe: $ssh_config"
+    return 2
+  fi
+  mode="$(/usr/bin/stat -f %Lp "$ssh_config" 2>/dev/null)" || return 2
+  [[ "$mode" == <-> ]] || return 2
+  permission=$(( 8#$mode ))
+  if (( (permission & 8#022) != 0 )); then
+    say_error "shvpn: SSH config is writable by group or others"
+    return 2
+  fi
+  [[ -x "$ssh_client" && -f "$ssh_client" ]] || {
+    say_error "shvpn: system OpenSSH client is unavailable: $ssh_client"
+    return 2
+  }
+  load_targets || return $?
+  return 0
+}
+
+collect_candidate_ssh_names() {
+  local name
+  local -A seen_names
+  candidate_ssh_names=()
+  explicit_name_set=()
+
+  for name in "$@"; do
+    if ! validate_ssh_name "$name"; then
+      say_error "shvpn: invalid SSH name: $name"
+      return 64
+    fi
+    explicit_name_set[$name]=1
+  done
+
+  collect_literal_ssh_names "$ssh_config"
+  for name in "${target_hosts[@]}" "${discovered_ssh_names[@]}" "$@"; do
+    [[ -n "$name" && -z "${seen_names[$name]:-}" ]] || continue
+    seen_names[$name]=1
+    candidate_ssh_names+=("$name")
+  done
+  return 0
+}
+
+check_vscode_and_codex() {
+  local settings_file skill_file
+  local -a vscode_extensions settings_files skill_files
+
+  vscode_extensions=(
+    "$HOME"/.vscode/extensions/ms-vscode-remote.remote-ssh-[0-9]*(N)
+    "$HOME"/.vscode-insiders/extensions/ms-vscode-remote.remote-ssh-[0-9]*(N)
+  )
+  if (( ${#vscode_extensions} > 0 )); then
+    print -r -- "doctor: VS Code Remote-SSH extension detected."
+  else
+    print -r -- "doctor: VS Code Remote-SSH extension not detected (optional)."
+  fi
+
+  settings_files=(
+    "$HOME/Library/Application Support/Code/User/settings.json"
+    "$HOME/Library/Application Support/Code - Insiders/User/settings.json"
+  )
+  for settings_file in "${settings_files[@]}"; do
+    [[ -e "$settings_file" || -L "$settings_file" ]] || continue
+    if ! safe_owned_regular "$settings_file"; then
+      say_error "doctor: warning: VS Code settings file is unsafe; integration was not inspected"
+      doctor_warnings=$(( doctor_warnings + 1 ))
+      continue
+    fi
+    if /usr/bin/grep -Eq '"remote\.SSH\.(configFile|path)"[[:space:]]*:' "$settings_file"; then
+      say_error "doctor: warning: VS Code selects a custom SSH path or config; verify that it uses this OpenSSH configuration"
+      doctor_warnings=$(( doctor_warnings + 1 ))
+    fi
+  done
+
+  skill_files=(
+    "$HOME/.agents/skills/ssh-remote/SKILL.md"
+    "$HOME/.codex/skills/ssh-remote/SKILL.md"
+  )
+  for skill_file in "${skill_files[@]}"; do
+    if safe_owned_regular "$skill_file"; then
+      print -r -- "doctor: Codex SSH skill detected; verified system OpenSSH routing applies."
+      return 0
+    fi
+  done
+  print -r -- "doctor: Codex SSH skill not detected; verified system OpenSSH routing is ready for tools that call ssh."
+  return 0
+}
+
+doctor_shvpn() {
+  local name rc
+  local doctor_failures=0
+  typeset -g doctor_warnings=0
+
+  prepare_ssh_diagnostics || return $?
+  collect_candidate_ssh_names "$@" || return $?
+
+  show_status
+  rc=$?
+  case "$rc" in
+    0|1) ;;
+    *) doctor_failures=$(( doctor_failures + 1 )) ;;
+  esac
+
+  if (( alias_scan_incomplete )); then
+    say_error "doctor: warning: SSH alias discovery was incomplete because of Include, safety, or scan limits; pass names explicitly"
+    doctor_warnings=$(( doctor_warnings + 1 ))
+  fi
+
+  for name in "${candidate_ssh_names[@]}"; do
+    if ! resolve_ssh_name "$name"; then
+      if [[ -n "${target_set[$name]:-}" ]]; then
+        say_error "doctor: target $name was rejected by ssh -G"
+        doctor_failures=$(( doctor_failures + 1 ))
+      elif [[ -n "${explicit_name_set[$name]:-}" ]]; then
+        say_error "doctor: warning: SSH name $name was rejected by ssh -G"
+        doctor_warnings=$(( doctor_warnings + 1 ))
+      fi
+      continue
+    fi
+
+    if [[ -n "${target_set[$name]:-}" && "$resolved_host" != "$name" ]]; then
+      say_error "doctor: target $name resolves to a different HostName"
+      doctor_failures=$(( doctor_failures + 1 ))
+      continue
+    fi
+    if [[ -n "${target_set[$resolved_host]:-}" ]]; then
+      if [[ "$resolved_proxy" != "$expected_route_proxy" ]]; then
+        say_error "doctor: SSH name $name has an earlier ProxyCommand or ProxyJump"
+        doctor_failures=$(( doctor_failures + 1 ))
+      elif [[ "$name" == "$resolved_host" ]]; then
+        print -r -- "doctor: target $name: managed route OK."
+      else
+        print -r -- "doctor: alias $name -> $resolved_host: managed route OK."
+      fi
+    elif [[ -n "${explicit_name_set[$name]:-}" ]]; then
+      say_error "doctor: warning: $name is not managed; its HostName must exactly equal an installed target"
+      doctor_warnings=$(( doctor_warnings + 1 ))
+    fi
+  done
+
+  check_vscode_and_codex
+  if (( doctor_failures > 0 )); then
+    say_error "doctor: core checks failed ($doctor_failures failure(s), $doctor_warnings warning(s))."
+    return 2
+  fi
+  if (( doctor_warnings > 0 )); then
+    say_error "doctor: core route is healthy with $doctor_warnings warning(s)."
+    return 1
+  fi
+  print -r -- "doctor: all checks passed."
+  return 0
+}
+
+reconnect_ssh() {
+  local name rc
+  local reconnect_failures=0
+  local reconnect_warnings=0
+  local closed=0
+  local -a eligible_names
+
+  prepare_ssh_diagnostics || return $?
+  collect_candidate_ssh_names "$@" || return $?
+  if (( alias_scan_incomplete )); then
+    say_error "reconnect: warning: SSH alias discovery was incomplete because of Include, safety, or scan limits; pass names explicitly"
+    reconnect_warnings=$(( reconnect_warnings + 1 ))
+  fi
+
+  eligible_names=()
+  for name in "${candidate_ssh_names[@]}"; do
+    if ! resolve_ssh_name "$name"; then
+      if [[ -n "${target_set[$name]:-}" ]]; then
+        say_error "reconnect: target $name was rejected by ssh -G"
+        return 2
+      elif [[ -n "${explicit_name_set[$name]:-}" ]]; then
+        say_error "reconnect: SSH name $name was rejected by ssh -G"
+        return 64
+      fi
+      continue
+    fi
+    if [[ -n "${target_set[$resolved_host]:-}" ]]; then
+      if [[ "$resolved_proxy" != "$expected_route_proxy" ]]; then
+        say_error "reconnect: SSH name $name is not using the managed route; refusing"
+        return 2
+      fi
+      eligible_names+=("$name")
+    elif [[ -n "${explicit_name_set[$name]:-}" ]]; then
+      say_error "reconnect: $name is not managed; its HostName must exactly equal an installed target"
+      return 64
+    fi
+  done
+
+  print -r -- "reconnect: checking configured masters for ShanghaiTech targets; active matching sessions may close."
+  for name in "${eligible_names[@]}"; do
+    if "$ssh_client" -F "$ssh_config" -O check -- "$name" >/dev/null 2>&1; then
+      if "$ssh_client" -F "$ssh_config" -O exit -- "$name" >/dev/null 2>&1; then
+        print -r -- "reconnect: closed configured master for $name."
+        closed=$(( closed + 1 ))
+      else
+        say_error "reconnect: failed to close the checked master for $name"
+        reconnect_failures=$(( reconnect_failures + 1 ))
+      fi
+    fi
+  done
+
+  if (( reconnect_failures > 0 )); then
+    return 2
+  fi
+  if (( closed == 0 )); then
+    print -r -- "reconnect: no active configured master was found."
+  fi
+  if (( reconnect_warnings > 0 )); then
+    return 1
+  fi
+  return 0
 }
 
 get_listener_pid() {
@@ -438,18 +840,28 @@ login_vpn() {
   return $?
 }
 
-if (( $# > 1 )); then
-  usage
-  exit 64
+if (( $# == 0 )); then
+  action="start"
+else
+  action="$1"
+  shift
 fi
-
-action="${1:-start}"
 case "$action" in
   status)
+    (( $# == 0 )) || { usage; exit 64; }
     show_status
     exit $?
     ;;
+  doctor)
+    doctor_shvpn "$@"
+    exit $?
+    ;;
+  reconnect)
+    reconnect_ssh "$@"
+    exit $?
+    ;;
   start|stop|login)
+    (( $# == 0 )) || { usage; exit 64; }
     prepare_runtime || exit $?
     acquire_operation_lock || exit $?
     case "$action" in

@@ -125,7 +125,7 @@ fixture_repo="$test_tmp/repo"
 fixture_home="$test_tmp/Fixture Home"
 fake_bin="$test_tmp/fake-bin"
 /bin/cp -R "$project_root" "$fixture_repo"
-/usr/bin/install -d -m 700 "$fixture_home/.ssh" "$fake_bin"
+/usr/bin/install -d -m 700 "$fixture_home/.ssh" "$fixture_home/.ssh/conf.d" "$fake_bin"
 
 # Keep fixture lifecycle checks isolated from a real shvpn listener on the test Mac.
 for fixture_template in shanghaitech-vpn.zsh shvpn.zsh shanghaitech-ssh-route.zsh; do
@@ -146,8 +146,21 @@ done
 } >"$fake_bin/go"
 /bin/chmod 755 "$fake_bin/go"
 
-print -r -- 'Host keep' >"$fixture_home/.ssh/config"
+print -r -- 'Include ~/.ssh/conf.d/*' >"$fixture_home/.ssh/config"
+print -r -- 'Host keep' >>"$fixture_home/.ssh/config"
 print -r -- '    HostName 192.0.2.30' >>"$fixture_home/.ssh/config"
+print -r -- 'Host gpu-main' >>"$fixture_home/.ssh/config"
+print -r -- '    HostName 192.0.2.10' >>"$fixture_home/.ssh/config"
+print -r -- '    User alias-user' >>"$fixture_home/.ssh/config"
+print -r -- '    Port 2201' >>"$fixture_home/.ssh/config"
+print -r -- '    ControlMaster auto' >>"$fixture_home/.ssh/config"
+print -r -- '    ControlPath ~/.ssh/cm-%C' >>"$fixture_home/.ssh/config"
+print -r -- 'Host gpu-include' >"$fixture_home/.ssh/conf.d/gpu.conf"
+print -r -- '    HostName 192.0.2.20' >>"$fixture_home/.ssh/conf.d/gpu.conf"
+print -r -- '    User include-user' >>"$fixture_home/.ssh/conf.d/gpu.conf"
+print -r -- '    Port 2202' >>"$fixture_home/.ssh/conf.d/gpu.conf"
+print -r -- '    ControlMaster auto' >>"$fixture_home/.ssh/conf.d/gpu.conf"
+print -r -- '    ControlPath ~/.ssh/cm-%C' >>"$fixture_home/.ssh/conf.d/gpu.conf"
 print -r -- '# existing zsh content' >"$fixture_home/.zshrc"
 /usr/bin/install -d -m 700 "$fixture_home/.local/bin"
 print -r -- '#!/bin/zsh' >"$fixture_home/.local/bin/zju-connect"
@@ -182,6 +195,62 @@ set -e
 [[ "$empty_interactive_rc" == 64 ]] || fail "interactive empty target list did not fail with 64"
 [[ ! -e "$fixture_home/.local/lib/shanghaitech-shvpn" ]] || fail "interactive empty target list created metadata"
 
+conflict_home="$test_tmp/Conflict Home"
+/usr/bin/install -d -m 700 "$conflict_home/.ssh/conf.d"
+print -r -- 'Include ~/.ssh/conf.d/*' >"$conflict_home/.ssh/config"
+print -r -- 'Host conflict-alias' >"$conflict_home/.ssh/conf.d/conflict.conf"
+print -r -- '    HostName 192.0.2.10' >>"$conflict_home/.ssh/conf.d/conflict.conf"
+print -r -- '    ProxyCommand /usr/bin/nc 192.0.2.99 22' >>"$conflict_home/.ssh/conf.d/conflict.conf"
+/bin/cp -p "$conflict_home/.ssh/config" "$test_tmp/conflict-original-config"
+set +e
+HOME="$conflict_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive \
+  --target 192.0.2.10 \
+  --add-path >"$test_tmp/conflict-install.out" 2>"$test_tmp/conflict-install.err"
+conflict_install_rc=$?
+set -e
+[[ "$conflict_install_rc" == 65 ]] || fail "included alias proxy conflict returned $conflict_install_rc instead of 65"
+/usr/bin/grep -F 'earlier ProxyCommand or ProxyJump' "$test_tmp/conflict-install.err" >/dev/null || fail "included alias proxy conflict message missing"
+[[ ! -e "$conflict_home/.local/lib/shanghaitech-shvpn" ]] || fail "conflicting alias install created metadata"
+/usr/bin/cmp -s "$test_tmp/conflict-original-config" "$conflict_home/.ssh/config" || fail "conflicting alias install changed SSH config"
+
+jump_home="$test_tmp/Jump Conflict Home"
+/usr/bin/install -d -m 700 "$jump_home/.ssh/conf.d"
+print -r -- 'Include ~/.ssh/conf.d/*' >"$jump_home/.ssh/config"
+print -r -- 'Host jump-conflict-alias' >"$jump_home/.ssh/conf.d/conflict.conf"
+print -r -- '    HostName 192.0.2.10' >>"$jump_home/.ssh/conf.d/conflict.conf"
+print -r -- '    ProxyJump jump.example.test' >>"$jump_home/.ssh/conf.d/conflict.conf"
+/bin/cp -p "$jump_home/.ssh/config" "$test_tmp/jump-original-config"
+set +e
+HOME="$jump_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive \
+  --target 192.0.2.10 \
+  --add-path >"$test_tmp/jump-install.out" 2>"$test_tmp/jump-install.err"
+jump_install_rc=$?
+set -e
+[[ "$jump_install_rc" == 65 ]] || fail "included alias ProxyJump conflict returned $jump_install_rc instead of 65"
+/usr/bin/grep -F 'earlier ProxyCommand or ProxyJump' "$test_tmp/jump-install.err" >/dev/null || fail "included alias ProxyJump conflict message missing"
+[[ ! -e "$jump_home/.local/lib/shanghaitech-shvpn" ]] || fail "ProxyJump conflict install created metadata"
+/usr/bin/cmp -s "$test_tmp/jump-original-config" "$jump_home/.ssh/config" || fail "ProxyJump conflict install changed SSH config"
+
+warning_home="$test_tmp/Warning Home"
+outside_ssh="$test_tmp/outside-ssh"
+/usr/bin/install -d -m 700 "$warning_home/.ssh" "$outside_ssh"
+print -r -- 'Host outside-only' >"$outside_ssh/hosts.conf"
+print -r -- '    HostName 192.0.2.90' >>"$outside_ssh/hosts.conf"
+print -r -- "Include $outside_ssh/*.conf" >"$warning_home/.ssh/config"
+HOME="$warning_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive \
+  --target 192.0.2.40 \
+  --no-path >"$test_tmp/warning-install.out" 2>"$test_tmp/warning-install.err"
+/usr/bin/grep -F 'SSH alias discovery was incomplete because of Include, safety, or scan limits' "$test_tmp/warning-install.err" >/dev/null || fail "incomplete alias discovery warning missing"
+set +e
+HOME="$warning_home" "$warning_home/.local/bin/shvpn" doctor >"$test_tmp/warning-doctor.out" 2>"$test_tmp/warning-doctor.err"
+warning_doctor_rc=$?
+set -e
+if [[ "$warning_doctor_rc" != 1 ]]; then
+  /bin/cat "$test_tmp/warning-doctor.out" "$test_tmp/warning-doctor.err" >&2
+  fail "doctor incomplete include warning returned $warning_doctor_rc instead of 1"
+fi
+HOME="$warning_home" PATH="$fixture_path" "$fixture_repo/uninstall.zsh" >/dev/null
+
 HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive \
   --target 192.0.2.10 \
   --target 192.0.2.20 \
@@ -201,6 +270,9 @@ assert_count 1 "$begin_path" "$fixture_home/.zshrc"
   print -r -- '192.0.2.20'
 } >"$test_tmp/expected-targets.tsv"
 /usr/bin/cmp -s "$test_tmp/expected-targets.tsv" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "target TSV differs"
+assert_count 1 'Match final host 192.0.2.10,192.0.2.20' "$fixture_home/.ssh/config"
+assert_count 0 'Host 192.0.2.10' "$fixture_home/.ssh/config"
+assert_count 0 'Host 192.0.2.20' "$fixture_home/.ssh/config"
 
 for rendered in shanghaitech-vpn shvpn shanghaitech-ssh-route; do
   if /usr/bin/grep -F '@@' "$fixture_home/.local/bin/$rendered" >/dev/null 2>&1; then
@@ -223,19 +295,116 @@ ssh_override_output="$(/usr/bin/ssh -F "$fixture_home/.ssh/config" -G -p 2222 -l
 [[ "$(print -r -- "$ssh_override_output" | /usr/bin/awk '$1 == "port" {print $2; exit}')" == "2222" ]] || fail "ssh runtime port override mismatch"
 [[ "$(print -r -- "$ssh_override_output" | /usr/bin/awk '$1 == "user" {print $2; exit}')" == "alice" ]] || fail "ssh runtime user override mismatch"
 [[ "$(print -r -- "$ssh_override_output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')" == "$route_q %h %p" ]] || fail "ssh runtime override lost ProxyCommand"
-if /usr/bin/grep -E '^[[:space:]]+(Port|User)[[:space:]]' "$fixture_home/.ssh/config" >/dev/null 2>&1; then
+/usr/bin/awk -v begin="$begin_ssh" -v end="$end_ssh" '
+  $0 == begin { inside=1 }
+  inside { print }
+  $0 == end { inside=0 }
+' "$fixture_home/.ssh/config" >"$test_tmp/current-managed-ssh.block"
+if /usr/bin/grep -E '^[[:space:]]+(Port|User)[[:space:]]' "$test_tmp/current-managed-ssh.block" >/dev/null 2>&1; then
   fail "managed SSH config unexpectedly pins Port or User"
 fi
 keep_output="$(/usr/bin/ssh -F "$fixture_home/.ssh/config" -G keep 2>/dev/null)"
 if print -r -- "$keep_output" | /usr/bin/grep -q '^proxycommand '; then
   fail "unmanaged SSH alias received a ProxyCommand"
 fi
+main_alias_output="$(/usr/bin/ssh -F "$fixture_home/.ssh/config" -G gpu-main 2>/dev/null)"
+[[ "$(print -r -- "$main_alias_output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')" == "192.0.2.10" ]] || fail "main alias hostname mismatch"
+[[ "$(print -r -- "$main_alias_output" | /usr/bin/awk '$1 == "user" {print $2; exit}')" == "alias-user" ]] || fail "main alias user was not preserved"
+[[ "$(print -r -- "$main_alias_output" | /usr/bin/awk '$1 == "port" {print $2; exit}')" == "2201" ]] || fail "main alias port was not preserved"
+[[ "$(print -r -- "$main_alias_output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')" == "$route_q %h %p" ]] || fail "main alias did not inherit managed ProxyCommand"
+include_alias_output="$(HOME="$fixture_home" /usr/bin/ssh -F "$fixture_home/.ssh/config" -G gpu-include 2>/dev/null)"
+[[ "$(print -r -- "$include_alias_output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')" == "192.0.2.20" ]] || fail "included alias hostname mismatch"
+[[ "$(print -r -- "$include_alias_output" | /usr/bin/awk '$1 == "user" {print $2; exit}')" == "include-user" ]] || fail "included alias user was not preserved"
+[[ "$(print -r -- "$include_alias_output" | /usr/bin/awk '$1 == "port" {print $2; exit}')" == "2202" ]] || fail "included alias port was not preserved"
+[[ "$(print -r -- "$include_alias_output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')" == "$route_q %h %p" ]] || fail "included alias did not inherit managed ProxyCommand"
 
 set +e
 HOME="$fixture_home" "$fixture_home/.local/bin/shanghaitech-ssh-route" 192.0.2.99 22 >/dev/null 2>&1
 route_rc=$?
 set -e
 [[ "$route_rc" == 64 ]] || fail "route helper did not reject an unlisted target"
+
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor >"$test_tmp/doctor.out" 2>"$test_tmp/doctor.err" || fail "doctor did not pass on a healthy stopped fixture"
+/usr/bin/grep -F 'alias gpu-main -> 192.0.2.10: managed route OK' "$test_tmp/doctor.out" >/dev/null || fail "doctor did not validate the main alias"
+/usr/bin/grep -F 'alias gpu-include -> 192.0.2.20: managed route OK' "$test_tmp/doctor.out" >/dev/null || fail "doctor did not validate the included alias"
+/usr/bin/grep -F 'all checks passed' "$test_tmp/doctor.out" >/dev/null || fail "doctor success summary missing"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor gpu-main gpu-include >/dev/null || fail "doctor rejected multiple valid explicit aliases"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor keep >"$test_tmp/doctor-unmanaged.out" 2>"$test_tmp/doctor-unmanaged.err"
+doctor_unmanaged_rc=$?
+set -e
+[[ "$doctor_unmanaged_rc" == 1 ]] || fail "doctor unmanaged explicit alias returned $doctor_unmanaged_rc instead of 1"
+/usr/bin/grep -F 'HostName must exactly equal an installed target' "$test_tmp/doctor-unmanaged.err" >/dev/null || fail "doctor unmanaged alias message missing"
+
+/bin/chmod 644 "$fixture_home/.config/shanghaitech-shvpn/targets.tsv"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor >/dev/null 2>"$test_tmp/doctor-unsafe-targets.err"
+doctor_unsafe_rc=$?
+set -e
+[[ "$doctor_unsafe_rc" == 2 ]] || fail "doctor unsafe target mode returned $doctor_unsafe_rc instead of 2"
+/bin/chmod 600 "$fixture_home/.config/shanghaitech-shvpn/targets.tsv"
+
+for old_arity in "start extra" "stop extra" "status extra" "login extra"; do
+  set +e
+  HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" ${(z)old_arity} >/dev/null 2>&1
+  old_arity_rc=$?
+  set -e
+  [[ "$old_arity_rc" == 64 ]] || fail "old command arity returned $old_arity_rc: $old_arity"
+done
+for invalid_name_command in "doctor bad*" "reconnect bad*"; do
+  set +e
+  HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" ${(z)invalid_name_command} >/dev/null 2>&1
+  invalid_name_rc=$?
+  set -e
+  [[ "$invalid_name_rc" == 64 ]] || fail "invalid SSH name returned $invalid_name_rc: $invalid_name_command"
+done
+
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" reconnect >"$test_tmp/reconnect-none.out" 2>"$test_tmp/reconnect-none.err" || fail "reconnect no-master no-op failed"
+/usr/bin/grep -F 'no active configured master was found' "$test_tmp/reconnect-none.out" >/dev/null || fail "reconnect no-master summary missing"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" reconnect keep >/dev/null 2>"$test_tmp/reconnect-unmanaged.err"
+reconnect_unmanaged_rc=$?
+set -e
+[[ "$reconnect_unmanaged_rc" == 64 ]] || fail "reconnect unmanaged alias returned $reconnect_unmanaged_rc instead of 64"
+
+/bin/cp -p "$fixture_home/.local/bin/shvpn" "$test_tmp/doctor-real-shvpn"
+fake_ssh="$test_tmp/fake-ssh"
+fake_ssh_log="$test_tmp/fake-ssh.log"
+fake_ssh_log_q="${(qqq)fake_ssh_log}"
+{
+  print -r -- '#!/bin/zsh'
+  print -r -- 'set -u'
+  print -r -- 'if [[ "$*" == *"-G"* ]]; then'
+  print -r -- '  exec /usr/bin/ssh "$@"'
+  print -r -- 'fi'
+  print -r -- 'name="${@[-1]}"'
+  print -r -- 'if [[ "$*" == *"-O check"* ]]; then'
+  print -r -- "  print -r -- \"check \$name \$*\" >>$fake_ssh_log_q"
+  print -r -- '  [[ "$name" == "gpu-main" ]] && exit 0'
+  print -r -- '  exit 1'
+  print -r -- 'fi'
+  print -r -- 'if [[ "$*" == *"-O exit"* ]]; then'
+  print -r -- "  print -r -- \"exit \$name \$*\" >>$fake_ssh_log_q"
+  print -r -- '  [[ "$name" == "gpu-main" ]] && exit 0'
+  print -r -- '  exit 1'
+  print -r -- 'fi'
+  print -r -- 'exit 64'
+} >"$fake_ssh"
+/bin/chmod 755 "$fake_ssh"
+fake_ssh_q="${(qqq)fake_ssh}"
+/usr/bin/sed "s#typeset -gr ssh_client=\"/usr/bin/ssh\"#typeset -gr ssh_client=$fake_ssh_q#" \
+  "$test_tmp/doctor-real-shvpn" >"$test_tmp/shvpn-with-fake-ssh"
+/usr/bin/install -m 755 "$test_tmp/shvpn-with-fake-ssh" "$fixture_home/.local/bin/shvpn"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" reconnect >"$test_tmp/reconnect-success.out" 2>"$test_tmp/reconnect-success.err" || fail "reconnect fixture success path failed"
+/usr/bin/grep -F 'closed configured master for gpu-main' "$test_tmp/reconnect-success.out" >/dev/null || fail "reconnect did not report the closed alias master"
+/usr/bin/awk '
+  $1 == "check" && $2 == "gpu-main" { checked=NR }
+  $1 == "exit" && $2 == "gpu-main" { exited=NR; exits++ }
+  END { exit !(checked && exited == checked + 1 && exits == 1) }
+' "$fake_ssh_log" || fail "reconnect did not issue one check immediately before exit for the managed alias"
+/usr/bin/grep -F "check gpu-main -F $fixture_home/.ssh/config -O check -- gpu-main" "$fake_ssh_log" >/dev/null || fail "reconnect check was not bound to the installed SSH config"
+/usr/bin/grep -F "exit gpu-main -F $fixture_home/.ssh/config -O exit -- gpu-main" "$fake_ssh_log" >/dev/null || fail "reconnect exit was not bound to the installed SSH config"
+/usr/bin/install -m 755 "$test_tmp/doctor-real-shvpn" "$fixture_home/.local/bin/shvpn"
 
 /bin/cp -p "$fixture_home/.local/bin/shvpn" "$test_tmp/real-shvpn"
 route_status_marker="$test_tmp/route-status.marker"
@@ -312,6 +481,7 @@ if [[ "${SHVPN_RUN_UPSTREAM:-0}" == "1" ]]; then
   HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" start >/dev/null
   lifecycle_started=1
   HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" status >/dev/null || fail "trusted lifecycle status did not report running"
+  HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor >/dev/null || fail "doctor did not accept a trusted running VPN"
   HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" start >/dev/null || fail "repeated trusted start was not idempotent"
   HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" stop >/dev/null || fail "trusted lifecycle stop failed"
   lifecycle_started=0
@@ -368,8 +538,14 @@ post_migration_backup_count="$(/usr/bin/find "$fixture_home/.local/lib/shanghait
 (( post_migration_backup_count > legacy_backup_count )) || fail "legacy migration did not preserve a new backup"
 /usr/bin/cmp -s "$test_tmp/expected-targets.tsv" "$fixture_home/.config/shanghaitech-shvpn/targets.tsv" || fail "legacy target TSV was not replaced"
 assert_count 0 'Host gpu' "$fixture_home/.ssh/config"
-assert_count 1 'Host 192.0.2.10' "$fixture_home/.ssh/config"
-if /usr/bin/grep -E '^[[:space:]]+(Port|User)[[:space:]]' "$fixture_home/.ssh/config" >/dev/null 2>&1; then
+assert_count 0 'Host 192.0.2.10' "$fixture_home/.ssh/config"
+assert_count 1 'Match final host 192.0.2.10,192.0.2.20' "$fixture_home/.ssh/config"
+/usr/bin/awk -v begin="$begin_ssh" -v end="$end_ssh" '
+  $0 == begin { inside=1 }
+  inside { print }
+  $0 == end { inside=0 }
+' "$fixture_home/.ssh/config" >"$test_tmp/migrated-managed-ssh.block"
+if /usr/bin/grep -E '^[[:space:]]+(Port|User)[[:space:]]' "$test_tmp/migrated-managed-ssh.block" >/dev/null 2>&1; then
   fail "legacy Port or User survived address-only migration"
 fi
 
@@ -385,7 +561,7 @@ second_backup_count="$(/usr/bin/find "$fixture_home/.local/lib/shanghaitech-shvp
 
 /bin/cp -p "$fixture_home/.ssh/config" "$test_tmp/installed-ssh-config"
 client_before="$(/usr/bin/shasum -a 256 "$fixture_home/.local/bin/zju-connect" | /usr/bin/awk '{print $1}')"
-/usr/bin/sed 's/HostName 192\.0\.2\.10/HostName 192.0.2.11/' "$fixture_home/.ssh/config" >"$test_tmp/modified-ssh-config"
+/usr/bin/sed 's/Match final host 192\.0\.2\.10,192\.0\.2\.20/Match final host 192.0.2.11,192.0.2.20/' "$fixture_home/.ssh/config" >"$test_tmp/modified-ssh-config"
 /usr/bin/install -m 600 "$test_tmp/modified-ssh-config" "$fixture_home/.ssh/config"
 set +e
 HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/uninstall.zsh" >/dev/null 2>&1
@@ -431,7 +607,7 @@ HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/uninstall.zsh" >/dev/nu
 
 print -rn -- $'192.0.2.40\n\n' | HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --no-path >/dev/null
 assert_count 0 "$begin_path" "$fixture_home/.zshrc"
-assert_count 1 'Host 192.0.2.40' "$fixture_home/.ssh/config"
+assert_count 1 'Match final host 192.0.2.40' "$fixture_home/.ssh/config"
 HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/uninstall.zsh" >/dev/null
 /usr/bin/cmp -s "$test_tmp/original-zshrc" "$fixture_home/.zshrc" || fail "interactive --no-path cycle changed .zshrc"
 

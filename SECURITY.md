@@ -31,13 +31,23 @@
 
 SSH 路由助手只接受安装时写入 0600 allowlist 的服务器地址。已配置地址可使用 OpenSSH 在运行时传入的任意有效端口（`1`–`65535`）；未配置地址以及无效端口都会被拒绝。VPN 安全停止时走直连；VPN 可信运行时走 SOCKS；监听者、文件权限或进程身份含糊时拒绝连接。
 
+安装器使用 `Match final host ...`，让 OpenSSH 在 alias 应用 `HostName` 后按最终主机名匹配。它不会给 `Host *` 安装全局代理，也不会复制或改写用户 alias。最终 `HostName` 必须与 allowlist 中某一行完全一致；项目不会通过 DNS 把域名和 IP 扩展成等价信任目标。
+
+OpenSSH 对多数配置项采用“先取得的值生效”。因此，alias 较早设置的 `ProxyCommand` 或 `ProxyJump` 可能阻止本项目的后置规则。安装器和 `shvpn doctor` 会检查主配置以及 `~/.ssh` 内常见的安全 Include：仅遍历当前用户拥有、非符号链接、物理路径仍在 `~/.ssh` 内的普通文件，并限制深度、文件数和 alias 数；不会 source SSH 配置。复杂、目录外、不安全或无法完整枚举的 Include 会产生明确警告，不会伪称已检查全部 alias。用户可用 `shvpn doctor ALIAS` 对指定名字执行最终 `ssh -G` 验证。
+
+自动枚举只收集字面量 Host 名称，不展开 `Host gpu-*` 一类模式；具体名字必须显式传给 `shvpn doctor`。安装器、`doctor` 和 `reconnect` 使用 `-F ~/.ssh/config` 绑定用户配置，因此按 OpenSSH 规则忽略 `/etc/ssh/ssh_config`。普通 `ssh` 默认仍读取系统配置；如果系统级 `ProxyCommand`/`ProxyJump` 先取得值，可能阻止后置的托管路由。在受 MDM 或集中 SSH 配置管理的 Mac 上，应额外用不带 `-F` 的 `/usr/bin/ssh -G ALIAS` 核对最终 `proxycommand`。这是系统配置边界，不应把仅有 `doctor` 的通过解释为已审计系统级规则。
+
+`shvpn doctor` 不建立远程 SSH 连接，也不启动或停止 VPN。它读取托管文件、受限 SSH 配置和已知 VS Code settings 文件，并只判断 `remote.SSH.configFile`、`remote.SSH.path` 两个键是否存在；不会输出完整 settings。诊断会显示本地目标和 alias，公开分享前仍需删减。
+
+`shvpn reconnect` 是用户显式调用的中断性操作。它只处理 `ssh -G` 最终主机在 allowlist 中、且有效 `ProxyCommand` 精确等于本项目助手的名字；对每个名字先执行 `ssh -O check`，成功后才执行 `ssh -O exit`。它不删除 ControlPath、不扫描或发送信号给 SSH 进程、不尝试远程 shell，也不会从 `start`、`stop` 或网络变化中自动触发。命令行覆盖的工具自有 ControlPath 不会被推断或处理。
+
 路由助手先验证监听进程，再调用系统 `nc` 连接回环 SOCKS 端口；这两个动作无法成为同一个原子操作。因此，拥有同一 macOS 用户权限的恶意本地进程理论上可能在检查后抢占端口。该限制不扩大到局域网，因为 SOCKS 只绑定回环地址，但本项目不把“同一用户下的恶意进程”视为可完全隔离的威胁边界。
 
 ## 文件覆盖与恢复
 
 安装器拒绝符号链接、非当前用户所有的文件、重复/损坏的托管标记和已修改的托管文件。首次安装会保存完整基线，之后每次写入前再创建带时间戳的哈希备份。
 
-地址模式升级会把哈希一致、受信任的旧版 alias/host/port/user 目标文件和 SSH 托管块整体替换。旧 alias 及旧版生成的 `Port`、`User` 不会保留；原始安装前基线仍由卸载器恢复。
+地址模式升级会把哈希一致、受信任的旧版 alias/host/port/user 目标文件和 SSH 托管块整体替换。旧安装器托管块内的 alias 及其生成的 `Port`、`User` 不会保留；用户在托管块外的 alias 不会被改写，并会按最终 `HostName` 自动接入。原始安装前基线仍由卸载器恢复。
 
 `~/.local/bin/zju-connect` 可能与其他学校或其他用途的现有安装重名。如果它是安全的普通文件，本项目会备份后替换，并在卸载时恢复；如果是符号链接或状态不明确，则拒绝安装。依赖同一路径运行其他网关的用户应先确认这一影响。
 

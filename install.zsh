@@ -183,6 +183,124 @@ validate_target() {
   [[ "$host" == [A-Za-z0-9][A-Za-z0-9.-]# ]] || die 64 "invalid SSH host: $host"
 }
 
+typeset -a discovered_ssh_names
+typeset -g alias_scan_incomplete=0
+
+mark_alias_scan_incomplete() {
+  alias_scan_incomplete=1
+}
+
+collect_literal_ssh_names() {
+  local root_config="$1"
+  local ssh_root="$2"
+  local config_file physical_file line first_word keyword first_arg word value
+  local include_arg include_pattern include_match physical_match
+  local queue_index=1
+  local depth next_depth
+  local -a file_queue depth_queue words directive_args include_matches
+  local -A seen_files seen_names
+
+  discovered_ssh_names=()
+  alias_scan_incomplete=0
+  file_queue=("$root_config")
+  depth_queue=(0)
+
+  while (( queue_index <= ${#file_queue} )); do
+    config_file="${file_queue[$queue_index]}"
+    depth="${depth_queue[$queue_index]}"
+    queue_index=$(( queue_index + 1 ))
+
+    physical_file="${config_file:A}"
+    [[ -z "${seen_files[$physical_file]:-}" ]] || continue
+    seen_files[$physical_file]=1
+
+    if [[ ! -f "$config_file" || -L "$config_file" ]]; then
+      mark_alias_scan_incomplete
+      continue
+    fi
+    if [[ "$config_file" != "$root_config" ]]; then
+      if [[ "$physical_file" != "$ssh_root"/* || "$(/usr/bin/stat -f %u "$config_file" 2>/dev/null)" != "$current_uid" ]]; then
+        mark_alias_scan_incomplete
+        continue
+      fi
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      words=("${(z)line}")
+      (( ${#words} > 0 )) || continue
+      first_word="${(Q)words[1]}"
+      [[ "$first_word" != \#* ]] || continue
+      directive_args=()
+      if [[ "$first_word" == *=* ]]; then
+        keyword="${${first_word%%=*}:l}"
+        first_arg="${first_word#*=}"
+        [[ -n "$first_arg" ]] && directive_args+=("$first_arg")
+      else
+        keyword="${first_word:l}"
+      fi
+      for word in "${words[@]:1}"; do
+        value="${(Q)word}"
+        [[ "$value" != \#* ]] || break
+        directive_args+=("$value")
+      done
+
+      case "$keyword" in
+        host)
+          for value in "${directive_args[@]}"; do
+            if [[ "$value" == [A-Za-z0-9][A-Za-z0-9._-]# ]]; then
+              if [[ -z "${seen_names[$value]:-}" ]]; then
+                if (( ${#discovered_ssh_names} >= 4096 )); then
+                  mark_alias_scan_incomplete
+                  break
+                fi
+                seen_names[$value]=1
+                discovered_ssh_names+=("$value")
+              fi
+            fi
+          done
+          ;;
+        include)
+          if (( depth >= 8 )); then
+            (( ${#directive_args} == 0 )) || mark_alias_scan_incomplete
+            continue
+          fi
+          for include_arg in "${directive_args[@]}"; do
+            if [[ -z "$include_arg" || "$include_arg" == *[$'\n\r\t'\|\;\<\>\`\$\(\)\{\}]* ]]; then
+              mark_alias_scan_incomplete
+              continue
+            fi
+            case "$include_arg" in
+              /*) include_pattern="$include_arg" ;;
+              '~/'*) include_pattern="$HOME/${include_arg#\~/}" ;;
+              *) include_pattern="$ssh_root/$include_arg" ;;
+            esac
+            if [[ "$include_pattern" != "$ssh_root"/* || "/$include_pattern/" == */../* ]]; then
+              mark_alias_scan_incomplete
+              continue
+            fi
+            include_matches=( ${~include_pattern}(N) )
+            for include_match in "${include_matches[@]}"; do
+              physical_match="${include_match:A}"
+              if [[ ! -f "$include_match" || -L "$include_match" || "$physical_match" != "$ssh_root"/* || "$(/usr/bin/stat -f %u "$include_match" 2>/dev/null)" != "$current_uid" ]]; then
+                mark_alias_scan_incomplete
+                continue
+              fi
+              [[ -z "${seen_files[$physical_match]:-}" ]] || continue
+              if (( ${#file_queue} >= 64 )); then
+                mark_alias_scan_incomplete
+                continue
+              fi
+              next_depth=$(( depth + 1 ))
+              file_queue+=("$include_match")
+              depth_queue+=("$next_depth")
+            done
+          done
+          ;;
+      esac
+    done <"$config_file"
+  done
+}
+
 typeset -a target_hosts
 target_hosts=()
 non_interactive=0
@@ -351,6 +469,10 @@ quote_for_zsh "$shvpn"; shvpn_q="$REPLY"
 quote_for_zsh "$state_dir"; state_dir_q="$REPLY"
 quote_for_zsh "$targets_file"; targets_q="$REPLY"
 quote_for_zsh "$route"; route_command_q="$REPLY"
+quote_for_zsh "$route"; route_q="$REPLY"
+quote_for_zsh "$ssh_config"; ssh_config_q="$REPLY"
+route_proxy="$route_command_q %h %p"
+quote_for_zsh "$route_proxy"; route_proxy_q="$REPLY"
 
 content="$(<"$project_root/libexec/shanghaitech-vpn.zsh")"
 content="${content//@@CLIENT_Q@@/$client_q}"
@@ -363,6 +485,10 @@ content="${content//@@CLIENT_Q@@/$client_q}"
 content="${content//@@LAUNCHER_Q@@/$launcher_q}"
 content="${content//@@SHVPN_Q@@/$shvpn_q}"
 content="${content//@@STATE_DIR_Q@@/$state_dir_q}"
+content="${content//@@TARGETS_Q@@/$targets_q}"
+content="${content//@@ROUTE_Q@@/$route_q}"
+content="${content//@@ROUTE_PROXY_Q@@/$route_proxy_q}"
+content="${content//@@SSH_CONFIG_Q@@/$ssh_config_q}"
 [[ "$content" != *'@@'* ]] || die 65 "unresolved shvpn template token"
 print -rn -- "$content" >"$work_dir/shvpn"
 
@@ -380,10 +506,10 @@ print -rn -- "$content" >"$work_dir/shanghaitech-ssh-route"
 print -r -- "$begin_ssh" >>"$work_dir/ssh.block"
 for target_host in "${target_hosts[@]}"; do
   print -r -- "$target_host" >>"$work_dir/targets.tsv"
-  print -r -- "Host $target_host" >>"$work_dir/ssh.block"
-  print -r -- "    HostName $target_host" >>"$work_dir/ssh.block"
-  print -r -- "    ProxyCommand $route_command_q %h %p" >>"$work_dir/ssh.block"
 done
+target_pattern="${(j:,:)target_hosts}"
+print -r -- "Match final host $target_pattern" >>"$work_dir/ssh.block"
+print -r -- "    ProxyCommand $route_proxy" >>"$work_dir/ssh.block"
 print -r -- "$end_ssh" >>"$work_dir/ssh.block"
 
 marker_count "$ssh_config" "$begin_ssh" || die 65 "cannot inspect SSH markers"
@@ -400,6 +526,7 @@ if (( ssh_begin_count == 1 )); then
   [[ "$current_block_sha" == "$REPLY" ]] || die 65 "managed SSH block was modified; refusing overwrite"
 fi
 strip_marked_block "$ssh_config" "$work_dir/ssh.base" "$begin_ssh" "$end_ssh" || die 65 "cannot prepare SSH config"
+collect_literal_ssh_names "$work_dir/ssh.base" "$ssh_dir"
 append_block "$work_dir/ssh.base" "$work_dir/ssh.block" "$work_dir/ssh.config"
 
 discovered_ssh="$(command -v ssh)"
@@ -418,11 +545,36 @@ for target_host in "${target_hosts[@]}"; do
     ssh_output="$($ssh_client -F "$work_dir/ssh.config" -G "$target_host" 2>/dev/null)" || die 65 "ssh -G rejected target $target_host"
     resolved_host="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')"
     resolved_proxy="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')"
-    [[ "$resolved_host" == "$target_host" && "$resolved_proxy" == "$route_command_q %h %p" ]] || die 65 "SSH target $target_host resolves outside the managed configuration"
+    [[ "$resolved_host" == "$target_host" && "$resolved_proxy" == "$route_proxy" ]] || die 65 "SSH target $target_host resolves outside the managed configuration"
     validated_ssh_clients=$(( validated_ssh_clients + 1 ))
   done
   (( validated_ssh_clients > 0 )) || die 69 "no usable OpenSSH client validated target $target_host"
 done
+
+for ssh_name in "${discovered_ssh_names[@]}"; do
+  [[ -z "${seen_hosts[$ssh_name]:-}" ]] || continue
+  validated_ssh_clients=0
+  seen_ssh_clients=()
+  for ssh_client in "${ssh_candidates[@]}"; do
+    [[ -x "$ssh_client" ]] || continue
+    ssh_client="${ssh_client:A}"
+    [[ -f "$ssh_client" && -x "$ssh_client" ]] || continue
+    [[ -z "${seen_ssh_clients[$ssh_client]:-}" ]] || continue
+    seen_ssh_clients[$ssh_client]=1
+    ssh_output="$($ssh_client -F "$work_dir/ssh.config" -G -- "$ssh_name" 2>/dev/null)" || die 65 "ssh -G rejected discovered alias $ssh_name"
+    resolved_host="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')"
+    if [[ -n "${seen_hosts[$resolved_host]:-}" ]]; then
+      resolved_proxy="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')"
+      [[ "$resolved_proxy" == "$route_proxy" ]] || die 65 "SSH alias $ssh_name has an earlier ProxyCommand or ProxyJump; refusing incomplete routing"
+    fi
+    validated_ssh_clients=$(( validated_ssh_clients + 1 ))
+  done
+  (( validated_ssh_clients > 0 )) || die 69 "no usable OpenSSH client validated alias $ssh_name"
+done
+
+if (( alias_scan_incomplete )); then
+  say_error "install: warning: SSH alias discovery was incomplete because of Include, safety, or scan limits; run 'shvpn doctor ALIAS' for names not checked automatically"
+fi
 
 marker_count "$zshrc" "$begin_path" || die 65 "cannot inspect PATH markers"
 path_begin_count="$REPLY"
@@ -534,11 +686,15 @@ if [[ "$path_choice" == "add" ]]; then
   print -r -- "  shvpn login    # 首次登录或登录过期时"
   print -r -- "  shvpn          # 后台启动"
   print -r -- "  shvpn status"
+  print -r -- "  shvpn doctor"
+  print -r -- "  shvpn reconnect # 可选：关闭目标服务器的配置型 SSH 复用连接"
   print -r -- "  shvpn stop"
 else
   print -r -- "  $shvpn login"
   print -r -- "  $shvpn"
   print -r -- "  $shvpn status"
+  print -r -- "  $shvpn doctor"
+  print -r -- "  $shvpn reconnect"
   print -r -- "  $shvpn stop"
 fi
 for target_host in "${target_hosts[@]}"; do

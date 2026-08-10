@@ -10,8 +10,10 @@
 - `shvpn login` 负责首次登录或登录过期后的浏览器 CAS 流程。
 - `shvpn` 后台启动，`shvpn stop` 安全关闭。
 - 只有安装时列出的 SSH 目标使用本地 SOCKS 端口 `127.0.0.1:11080`。
-- 在校内、VPN 未启动时，同一个 `ssh <服务器地址>` 自动走直连。
+- 在校内、VPN 未启动时，同一个服务器地址或现有 SSH alias 自动走直连。
 - 终端、VS Code Remote-SSH 以及调用系统 OpenSSH 的 Codex 使用同一份配置。
+- `shvpn doctor` 在本地检查 VPN、SSH alias、VS Code 和 Codex/OpenSSH 兼容性。
+- `shvpn reconnect` 可选地关闭这些服务器的配置型 SSH 复用连接，让下一次连接重新选路。
 - 不退出、不修改 Clash Verge，也不启用 TUN 或 macOS 系统代理。
 
 ## 支持范围
@@ -43,6 +45,7 @@ cd shanghaitech-shvpn
 shvpn login    # 第一次使用；登录过期时也运行它
 shvpn          # 以后后台启动
 shvpn status
+shvpn doctor   # 纯本地检查，不登录服务器
 ssh gpu1.example.edu   # 换成你配置的服务器地址
 shvpn stop
 ```
@@ -66,6 +69,24 @@ Codex 不需要、也不应该读取你的密码、私钥、`client-data.json` �
 
 每个 `--target` 后只写一个服务器地址。如果不希望修改 `~/.zshrc`，使用 `--no-path`；此时安装器会输出 `$HOME/.local/bin/shvpn` 的完整命令。
 
+安装器不会询问或复制 alias。它使用 OpenSSH 的最终主机匹配：如果你已有如下配置，`ssh gpu`、VS Code 中的 `gpu` 和 Codex 使用的 `gpu` 都会自动接入同一条路由，同时保留原有 `User`、`Port`、`IdentityFile` 和 ControlMaster 设置：
+
+```sshconfig
+Host gpu
+    HostName gpu1.example.edu
+    User alice
+```
+
+这里的 `HostName` 必须与安装时提供的某一个服务器地址**完全一致**。项目不会把域名和 IP 通过 DNS 推断为同一个信任目标。例如安装的是 `192.0.2.10` 时，`HostName gpu1.example.edu` 不会自动视作这个地址。
+
+常见的 `Include ~/.ssh/conf.d/*` 也会工作。安装器和 `doctor` 会在严格的所有者、非符号链接、`~/.ssh` 范围和数量限制内检查这些文件。如果某个复杂或目录外的 Include 无法安全枚举，安装器会警告；连接仍按 OpenSSH 的最终 `HostName` 匹配，建议另外运行：
+
+```zsh
+shvpn doctor gpu
+```
+
+`Host gpu-*` 这类通配 Host 组不能被自动枚举；请用具体名字运行 `shvpn doctor gpu-01`。另外，安装器、`doctor` 和 `reconnect` 会用 `-F ~/.ssh/config` 绑定本项目管理的用户配置，因此不会读取 `/etc/ssh/ssh_config`。普通 `ssh` 仍会读取系统配置；如果学校、公司 MDM 或其他系统级配置提前设置了 `ProxyCommand`/`ProxyJump`，它可能按 OpenSSH 的“先取得的值生效”规则覆盖本项目。此类 Mac 请再运行不带 `-F` 的 `/usr/bin/ssh -G 具体名字`，确认最终 `proxycommand` 仍指向 `shanghaitech-ssh-route`。
+
 用户名和非默认端口在连接时照常交给 OpenSSH，例如：
 
 ```zsh
@@ -73,12 +94,12 @@ ssh alice@gpu1.example.edu
 ssh -p 2222 alice@gpu1.example.edu
 ```
 
-从旧版重装会把受信任的旧 alias/host/port/user 托管块原子替换为地址模式。旧 alias 以及安装器写入的 `Port`、`User` 会消失；请改用服务器地址连接，并在命令行或你自己的非托管 SSH 配置中提供用户名和端口。
+从最早的 alias/host/port/user 版本重装时，旧安装器自己生成的 alias 定义仍会随旧托管块移除；用户在托管块外已有的 alias 不会被改写，并会自动按最终 `HostName` 接入。请把需要长期保留的 alias 放在你自己的非托管 SSH 配置中。
 
 ## 网络路径
 
 ```text
-ssh gpu1.example.edu
+ssh gpu                       # 或 ssh gpu1.example.edu
   └─ ProxyCommand（仅这个服务器地址）
        ├─ shvpn 正在可信运行 → 127.0.0.1:11080 → 上科大 VPN → GPU
        ├─ shvpn 已停止       → 直接连接 GPU（适合校内）
@@ -86,6 +107,31 @@ ssh gpu1.example.edu
 ```
 
 SSH 已存在的 ControlMaster 连接会继续使用建立时的路径；新终端、VS Code 或 Codex 新建的 SSH 连接才会自动选择当前路径。
+
+## 检查与重新选路
+
+```zsh
+shvpn doctor                 # 自动检查目标和常见配置中的 alias
+shvpn doctor gpu gpu2        # 额外检查复杂 Include 中的指定 alias
+```
+
+`doctor` 只读取本地受限配置并对绑定的用户配置运行 `ssh -F ~/.ssh/config -G`，不会登录服务器；它不检查上文所述的系统级 SSH 配置：
+
+- 退出码 `0`：核心路由和已检测集成正常；
+- 退出码 `1`：核心路由正常，但 Include、VS Code 自定义 SSH 路径等存在需要说明的警告；
+- 退出码 `2`：托管文件、目标路由或 VPN 监听状态不可信；
+- 退出码 `64`：参数无效。
+
+诊断输出会显示本地服务器地址和 alias，公开求助前请自行删减。
+
+切换网络后，如果旧 ControlMaster 没有及时失效，可以显式运行：
+
+```zsh
+shvpn reconnect              # 检查并关闭已配置目标/alias 的复用主连接
+shvpn reconnect gpu          # 额外指定未被自动枚举的 alias
+```
+
+它只会对最终 `HostName` 在 allowlist 中、且有效 `ProxyCommand` 正是本项目助手的名字先执行 `ssh -O check`，成功后才执行 `ssh -O exit`。它不删除 socket、不扫描或 kill SSH 进程，也绝不会由 `start`/`stop` 自动触发。该命令可能中断匹配主连接上的 VS Code、Codex 或终端会话；命令行单独覆盖 `ControlPath` 的工具自有连接无法被安全推断，需要由该工具自行关闭。
 
 ## 安全与可撤销性
 
@@ -121,7 +167,7 @@ shvpn login
 
 ### VS Code 仍走旧路径
 
-先关闭对应的 Remote-SSH 窗口并重新连接。如果启用了 OpenSSH ControlMaster，旧连接要等复用通道结束后才会切换；本项目不会强制关闭你的 SSH 会话。
+先运行 `shvpn doctor <alias>`。确认核心路由正常后，关闭对应的 Remote-SSH 窗口并重新连接。如果启用了 OpenSSH ControlMaster，可以选择运行 `shvpn reconnect <alias>`；它只在你显式调用时请求关闭匹配连接。
 
 ## 补丁与许可证
 
