@@ -16,3 +16,7 @@ ShanghaiTech's official VPN instructions are published at:
 https://it.shanghaitech.edu.cn/2021/0424/c8423a63191/page.htm
 
 The official instructions describe the supported aTrust client workflow. This repository provides a community-maintained experimental alternative and makes no compatibility or support guarantee.
+
+Automatic CAS callback capture uses the Python package Playwright 1.62.0 and
+its pinned runtime dependencies. Playwright is distributed under the Apache
+License 2.0: https://github.com/microsoft/playwright-python

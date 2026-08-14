@@ -45,6 +45,16 @@ assert_manifest_hash() {
 for script in "$project_root"/*.zsh "$project_root"/libexec/*.zsh "$project_root"/tests/*.zsh; do
   /bin/zsh -n "$script" || fail "zsh syntax failed: $script"
 done
+test_python=""
+for python_candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
+  [[ -n "$python_candidate" && -x "$python_candidate" ]] || continue
+  if "$python_candidate" -I -B -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info[:2] <= (3, 14)))'; then
+    test_python="$python_candidate"
+    break
+  fi
+done
+[[ -n "$test_python" ]] || fail "Python 3.10-3.14 is required for login helper tests"
+"$test_python" -I -B "$project_root/tests/test_login_helper.py" || fail "automatic login helper tests failed"
 
 expected_paths=(
   .github/workflows/ci.yml
@@ -57,19 +67,30 @@ expected_paths=(
   config/targets.example.tsv
   install.zsh
   libexec/build-client.zsh
+  libexec/build-login-runtime.zsh
+  libexec/python-login-helper.py
   libexec/shanghaitech-ssh-route.zsh
   libexec/shanghaitech-vpn.zsh
   libexec/shvpn-config.zsh
   libexec/shvpn.zsh
   patches/zju-connect-v1.2.2-node-selection.patch
+  requirements-login.txt
   tests/test.zsh
+  tests/test_login_helper.py
   uninstall.zsh
 )
 actual_paths=("${(@f)$({
   /usr/bin/git -C "$project_root" ls-files
-  if [[ -f "$project_root/libexec/shvpn-config.zsh" ]] && ! /usr/bin/git -C "$project_root" ls-files --error-unmatch libexec/shvpn-config.zsh >/dev/null 2>&1; then
-    print -r -- libexec/shvpn-config.zsh
-  fi
+  for pending_path in \
+    libexec/build-login-runtime.zsh \
+    libexec/python-login-helper.py \
+    libexec/shvpn-config.zsh \
+    requirements-login.txt \
+    tests/test_login_helper.py; do
+    if [[ -f "$project_root/$pending_path" ]] && ! /usr/bin/git -C "$project_root" ls-files --error-unmatch "$pending_path" >/dev/null 2>&1; then
+      print -r -- "$pending_path"
+    fi
+  done
 } | LC_ALL=C /usr/bin/sort)}")
 [[ "${(j:\n:)actual_paths}" == "${(j:\n:)expected_paths}" ]] || {
   print -u2 -r -- "Expected manifest:"
@@ -138,7 +159,12 @@ cleanup() {
     /bin/kill -INT "$lock_client_pid" 2>/dev/null || true
   fi
   if [[ "${lock_login_pid:-}" == <-> ]] && /bin/kill -0 "$lock_login_pid" 2>/dev/null; then
-    /bin/kill -INT "$lock_login_pid" 2>/dev/null || true
+    cleanup_helper_pid="$(/usr/bin/pgrep -P "$lock_login_pid" 2>/dev/null || true)"
+    if [[ "$cleanup_helper_pid" == <-> ]]; then
+      /bin/kill -INT "$cleanup_helper_pid" 2>/dev/null || true
+    else
+      /bin/kill -INT "$lock_login_pid" 2>/dev/null || true
+    fi
     wait "$lock_login_pid" 2>/dev/null || true
   fi
   if [[ "${config_lock_holder_pid:-}" == <-> ]] && /bin/kill -0 "$config_lock_holder_pid" 2>/dev/null; then
@@ -177,6 +203,48 @@ done
   print -r -- '/bin/chmod 755 "$1"'
 } >"$fixture_repo/libexec/build-client.zsh"
 /bin/chmod 755 "$fixture_repo/libexec/build-client.zsh"
+{
+  print -r -- '#!/bin/zsh'
+  print -r -- 'set -eu'
+  print -r -- 'output_dir="$3"'
+  print -r -- '/usr/bin/install -d -m 700 "$output_dir/playwright"'
+  print -r -- 'print -r -- "" >"$output_dir/playwright/__init__.py"'
+  print -r -- 'print -r -- "class Error(Exception): pass" >"$output_dir/playwright/sync_api.py"'
+  print -r -- 'print -r -- "def sync_playwright(): raise RuntimeError('\''fixture only'\'')" >>"$output_dir/playwright/sync_api.py"'
+} >"$fixture_repo/libexec/build-login-runtime.zsh"
+/bin/chmod 755 "$fixture_repo/libexec/build-login-runtime.zsh"
+# The fixture helper never opens a browser. It retains the production tree
+# digest contract so the installer, doctor, and uninstaller exercise manifest
+# verification without downloading or importing the real Playwright package.
+{
+  print -r -- '#!/usr/bin/env python3'
+  print -r -- 'import argparse, hashlib, os, pathlib, signal, stat, subprocess, sys, time'
+  print -r -- 'def digest(root):'
+  print -r -- '    root = pathlib.Path(root); records = []'
+  print -r -- '    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):'
+  print -r -- '        for name in dirs:'
+  print -r -- '            p = pathlib.Path(current) / name; s = p.lstat()'
+  print -r -- '            assert "\\n" not in name and "\\r" not in name and stat.S_ISDIR(s.st_mode) and not p.is_symlink()'
+  print -r -- '        for name in files:'
+  print -r -- '            p = pathlib.Path(current) / name; s = p.lstat()'
+  print -r -- '            assert "\\n" not in name and "\\r" not in name and stat.S_ISREG(s.st_mode) and not p.is_symlink()'
+  print -r -- '            rel = p.relative_to(root).as_posix().encode()'
+  print -r -- '            records.append((rel, rel + b"\\0" + hashlib.sha256(p.read_bytes()).hexdigest().encode() + b"\\n"))'
+  print -r -- '    h = hashlib.sha256()'
+  print -r -- '    for _, record in sorted(records): h.update(record)'
+  print -r -- '    return h.hexdigest()'
+  print -r -- 'parser = argparse.ArgumentParser(); parser.add_argument("--tree-digest"); parser.add_argument("--package-dir"); parser.add_argument("--launcher"); parser.add_argument("--state-dir"); args = parser.parse_args()'
+  print -r -- 'if args.tree_digest: print(digest(args.tree_digest)); raise SystemExit(0)'
+  print -r -- 'pathlib.Path(args.state_dir).mkdir(parents=True, exist_ok=True)'
+  print -r -- '(pathlib.Path(args.state_dir) / "client-data.json").write_text("{}")'
+  print -r -- 'if os.environ.get("SHVPN_FIXTURE_HOLD_LOGIN") == "1":'
+  print -r -- '    child = subprocess.Popen([args.launcher], start_new_session=True)'
+  print -r -- '    def stop(*_):'
+  print -r -- '        os.killpg(child.pid, signal.SIGINT); child.wait(timeout=10); raise SystemExit(130)'
+  print -r -- '    signal.signal(signal.SIGINT, stop)'
+  print -r -- '    while True: time.sleep(0.05)'
+} >"$fixture_repo/libexec/python-login-helper.py"
+/bin/chmod 755 "$fixture_repo/libexec/python-login-helper.py"
 {
   print -r -- '#!/bin/zsh'
   print -r -- 'print -r -- "go version go1.25.6 darwin/arm64"'
@@ -310,9 +378,23 @@ assert_file_mode 600 "$fixture_home/.config/shanghaitech-shvpn/targets.tsv"
 assert_file_mode 600 "$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv"
 assert_file_mode 700 "$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh"
 assert_file_mode 700 "$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh"
-/usr/bin/grep -Fx $'format\t2' "$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv" >/dev/null || fail "fresh install did not write manifest format 2"
+assert_file_mode 700 "$fixture_home/.local/lib/shanghaitech-shvpn/python-login-helper.py"
+assert_file_mode 600 "$fixture_home/.local/lib/shanghaitech-shvpn/requirements-login.txt"
+[[ -d "$fixture_home/.local/lib/shanghaitech-shvpn/python-packages" && ! -L "$fixture_home/.local/lib/shanghaitech-shvpn/python-packages" ]] || fail "managed Python package tree is missing"
+/usr/bin/grep -Fx $'format\t3' "$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv" >/dev/null || fail "fresh install did not write manifest format 3"
 assert_count 1 "$begin_ssh" "$fixture_home/.ssh/config"
 assert_count 1 "$begin_path" "$fixture_home/.zshrc"
+
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" login >"$test_tmp/login.out" 2>"$test_tmp/login.err"
+fixture_login_rc=$?
+set -e
+[[ "$fixture_login_rc" == 1 ]] || fail "fixture automatic login/start returned $fixture_login_rc instead of the expected fake-client failure"
+/usr/bin/grep -F 'opening the dedicated ShanghaiTech CAS login window' "$test_tmp/login.out" >/dev/null || fail "automatic login did not invoke the managed helper"
+if /usr/bin/grep -E 'copy|paste|callback url:' "$test_tmp/login.out" "$test_tmp/login.err" >/dev/null 2>&1; then
+  fail "automatic login exposed obsolete manual callback instructions"
+fi
+assert_file_mode 600 "$fixture_home/Library/Application Support/ShanghaitechVPN/client-data.json"
 
 {
   print -r -- '192.0.2.10'
@@ -341,7 +423,11 @@ route_q="${(qqq)route_path}"
 fixture_manifest="$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv"
 fixture_config_helper="$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh"
 fixture_uninstall_helper="$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh"
-for helper_spec in "config-helper:$fixture_config_helper" "uninstall-helper:$fixture_uninstall_helper"; do
+for helper_spec in \
+  "config-helper:$fixture_config_helper" \
+  "uninstall-helper:$fixture_uninstall_helper" \
+  "login-helper:$fixture_home/.local/lib/shanghaitech-shvpn/python-login-helper.py" \
+  "login-requirements:$fixture_home/.local/lib/shanghaitech-shvpn/requirements-login.txt"; do
   assert_manifest_hash "${helper_spec%%:*}" "${helper_spec#*:}" "$fixture_manifest"
 done
 
@@ -581,6 +667,17 @@ HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor >"$test_tmp/doctor.
 /usr/bin/grep -F 'alias gpu-include -> 192.0.2.20: managed route OK' "$test_tmp/doctor.out" >/dev/null || fail "doctor did not validate the included alias"
 /usr/bin/grep -F 'all checks passed' "$test_tmp/doctor.out" >/dev/null || fail "doctor success summary missing"
 HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor gpu-main gpu-include >/dev/null || fail "doctor rejected multiple valid explicit aliases"
+fixture_package_file="$fixture_home/.local/lib/shanghaitech-shvpn/python-packages/playwright/sync_api.py"
+/bin/cp -p "$fixture_package_file" "$test_tmp/original-sync-api.py"
+print -r -- '# tampered' >>"$fixture_package_file"
+set +e
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor >/dev/null 2>"$test_tmp/doctor-tampered-runtime.err"
+doctor_runtime_rc=$?
+set -e
+[[ "$doctor_runtime_rc" == 2 ]] || fail "doctor modified login runtime returned $doctor_runtime_rc instead of 2"
+/usr/bin/grep -F 'Python package tree was modified' "$test_tmp/doctor-tampered-runtime.err" >/dev/null || fail "doctor modified login runtime message missing"
+/usr/bin/install -m 600 "$test_tmp/original-sync-api.py" "$fixture_package_file"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor >/dev/null || fail "doctor did not recover after restoring the login runtime"
 set +e
 HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor keep >"$test_tmp/doctor-unmanaged.out" 2>"$test_tmp/doctor-unmanaged.err"
 doctor_unmanaged_rc=$?
@@ -684,30 +781,36 @@ for invalid_port in 0 65536 invalid; do
 done
 /bin/cp -p "$test_tmp/real-shvpn" "$fixture_home/.local/bin/shvpn"
 
-if [[ "${SHVPN_RUN_UPSTREAM:-0}" == "1" ]]; then
-  command -v go >/dev/null 2>&1 || fail "Go is required for lifecycle tests"
-  [[ "$(go version)" == "go version go1.25.6 darwin/arm64" ]] || fail "lifecycle gate requires go1.25.6 darwin/arm64"
+if [[ -x /usr/bin/clang ]]; then
   {
-    print -r -- 'package main'
-    print -r -- 'import ('
-    print -r -- '  "net"'
-    print -r -- '  "os"'
-    print -r -- '  "os/signal"'
-    print -r -- ')'
-    print -r -- 'func main() {'
-    print -r -- '  listener, err := net.Listen("tcp", "127.0.0.1:19180")'
-    print -r -- '  if err != nil { panic(err) }'
-    print -r -- '  signals := make(chan os.Signal, 1)'
-    print -r -- '  signal.Notify(signals, os.Interrupt)'
-    print -r -- '  <-signals'
-    print -r -- '  _ = listener.Close()'
+    print -r -- '#include <arpa/inet.h>'
+    print -r -- '#include <signal.h>'
+    print -r -- '#include <string.h>'
+    print -r -- '#include <sys/socket.h>'
+    print -r -- '#include <unistd.h>'
+    print -r -- 'static volatile sig_atomic_t stopped = 0;'
+    print -r -- 'static void handle(int signal_number) { (void)signal_number; stopped = 1; }'
+    print -r -- 'int main(void) {'
+    print -r -- '  int listener = socket(AF_INET, SOCK_STREAM, 0);'
+    print -r -- '  int yes = 1;'
+    print -r -- '  struct sockaddr_in address;'
+    print -r -- '  if (listener < 0) return 1;'
+    print -r -- '  setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));'
+    print -r -- '  memset(&address, 0, sizeof(address));'
+    print -r -- '  address.sin_family = AF_INET; address.sin_port = htons(19180);'
+    print -r -- '  inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);'
+    print -r -- '  if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0) return 2;'
+    print -r -- '  if (listen(listener, 4) != 0) return 3;'
+    print -r -- '  signal(SIGINT, handle);'
+    print -r -- '  while (!stopped) pause();'
+    print -r -- '  close(listener); return 0;'
     print -r -- '}'
-  } >"$test_tmp/fake-client.go"
-  GOTOOLCHAIN=local CGO_ENABLED=0 go build -trimpath -o "$test_tmp/fake-zju-connect" "$test_tmp/fake-client.go"
+  } >"$test_tmp/fake-client.c"
+  /usr/bin/clang -Os -o "$test_tmp/fake-zju-connect" "$test_tmp/fake-client.c"
   /bin/cp -p "$fixture_home/.local/bin/zju-connect" "$test_tmp/fixture-installed-client"
   /usr/bin/install -m 755 "$test_tmp/fake-zju-connect" "$fixture_home/.local/bin/zju-connect"
 
-  HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" login >"$test_tmp/lock-login.out" 2>"$test_tmp/lock-login.err" &
+  HOME="$fixture_home" SHVPN_FIXTURE_HOLD_LOGIN=1 "$fixture_home/.local/bin/shvpn" login >"$test_tmp/lock-login.out" 2>"$test_tmp/lock-login.err" &
   lock_login_pid=$!
   lock_ready=0
   for (( i = 0; i < 80; i++ )); do
@@ -725,8 +828,19 @@ if [[ "${SHVPN_RUN_UPSTREAM:-0}" == "1" ]]; then
   set -e
   [[ "$contended_rc" == 75 ]] || fail "operation lock contention returned $contended_rc instead of 75"
   /usr/bin/grep -F 'another shvpn configuration or lifecycle operation is in progress' "$test_tmp/contended-stop.err" >/dev/null || fail "lifecycle configuration lock contention message missing"
-  /bin/kill -INT "$lock_client_pid"
-  wait "$lock_login_pid" || fail "foreground login did not exit cleanly after fixture SIGINT"
+  lock_helper_pid="$(/usr/bin/pgrep -P "$lock_login_pid" 2>/dev/null || true)"
+  [[ "$lock_helper_pid" == <-> ]] || fail "could not identify the fixture automatic-login helper"
+  /bin/kill -INT "$lock_helper_pid"
+  set +e
+  wait "$lock_login_pid"
+  lock_login_rc=$?
+  set -e
+  [[ "$lock_login_rc" != 0 ]] || fail "cancelled automatic login unexpectedly succeeded"
+  for (( i = 0; i < 40; i++ )); do
+    /usr/bin/nc -z 127.0.0.1 19180 >/dev/null 2>&1 || break
+    /bin/sleep 0.05
+  done
+  /usr/bin/nc -z 127.0.0.1 19180 >/dev/null 2>&1 && fail "cancelled automatic login left the fixture listener running"
   lock_client_pid=""
   lock_login_pid=""
 
@@ -775,14 +889,15 @@ manifest_path="$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv"
 /usr/bin/awk -F '\t' -v OFS='\t' \
   -v targets="$legacy_targets_sha" -v block="$legacy_ssh_block_sha" -v full="$legacy_ssh_full_sha" '
     $1 == "format" { $2="1" }
-    $1 == "config-helper" || $1 == "uninstall-helper" { next }
+    $1 == "config-helper" || $1 == "uninstall-helper" || $1 ~ /^login-/ { next }
     $1 == "targets" { $2=targets }
     $1 == "ssh-block" { $2=block }
     $1 == "ssh-full" { $2=full }
     { print }
   ' "$manifest_path" >"$test_tmp/legacy-manifest.tsv"
 /usr/bin/install -m 600 "$test_tmp/legacy-manifest.tsv" "$manifest_path"
-/bin/rm -f -- "$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh" "$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh"
+/bin/rm -f -- "$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh" "$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh" "$fixture_home/.local/lib/shanghaitech-shvpn/python-login-helper.py" "$fixture_home/.local/lib/shanghaitech-shvpn/requirements-login.txt"
+/bin/rm -rf -- "$fixture_home/.local/lib/shanghaitech-shvpn/python-packages"
 
 legacy_backup_count="$(/usr/bin/find "$fixture_home/.local/lib/shanghaitech-shvpn/backups" -mindepth 1 -maxdepth 1 -type d | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
 HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive \
@@ -795,7 +910,7 @@ post_migration_backup_count="$(/usr/bin/find "$fixture_home/.local/lib/shanghait
 assert_count 0 'Host gpu' "$fixture_home/.ssh/config"
 assert_count 0 'Host 192.0.2.10' "$fixture_home/.ssh/config"
 assert_count 1 'Match final host 192.0.2.10,192.0.2.20' "$fixture_home/.ssh/config"
-/usr/bin/grep -Fx $'format\t2' "$manifest_path" >/dev/null || fail "legacy migration did not write manifest format 2"
+/usr/bin/grep -Fx $'format\t3' "$manifest_path" >/dev/null || fail "legacy migration did not write manifest format 3"
 assert_manifest_hash config-helper "$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh" "$manifest_path"
 assert_manifest_hash uninstall-helper "$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh" "$manifest_path"
 /usr/bin/awk -v begin="$begin_ssh" -v end="$end_ssh" '
@@ -807,6 +922,23 @@ if /usr/bin/grep -E '^[[:space:]]+(Port|User)[[:space:]]' "$test_tmp/migrated-ma
   fail "legacy Port or User survived address-only migration"
 fi
 
+# Format 2 had trusted dynamic helpers but no automatic-login runtime.
+/usr/bin/awk -F '\t' -v OFS='\t' '
+  $1 == "format" { $2="2" }
+  $1 ~ /^login-/ { next }
+  { print }
+' "$manifest_path" >"$test_tmp/format2-manifest.tsv"
+/usr/bin/install -m 600 "$test_tmp/format2-manifest.tsv" "$manifest_path"
+/bin/rm -f -- "$fixture_home/.local/lib/shanghaitech-shvpn/python-login-helper.py" "$fixture_home/.local/lib/shanghaitech-shvpn/requirements-login.txt"
+/bin/rm -rf -- "$fixture_home/.local/lib/shanghaitech-shvpn/python-packages"
+HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive \
+  --target 192.0.2.10 \
+  --target 192.0.2.20 \
+  --add-path >/dev/null
+/usr/bin/grep -Fx $'format\t3' "$manifest_path" >/dev/null || fail "format-2 migration did not write manifest format 3"
+assert_manifest_hash login-helper "$fixture_home/.local/lib/shanghaitech-shvpn/python-login-helper.py" "$manifest_path"
+assert_manifest_hash login-requirements "$fixture_home/.local/lib/shanghaitech-shvpn/requirements-login.txt" "$manifest_path"
+
 first_backup_count="$(/usr/bin/find "$fixture_home/.local/lib/shanghaitech-shvpn/backups" -mindepth 1 -maxdepth 1 -type d | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
 HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-interactive \
   --target 192.0.2.10 \
@@ -816,6 +948,17 @@ assert_count 1 "$begin_ssh" "$fixture_home/.ssh/config"
 assert_count 1 "$begin_path" "$fixture_home/.zshrc"
 second_backup_count="$(/usr/bin/find "$fixture_home/.local/lib/shanghaitech-shvpn/backups" -mindepth 1 -maxdepth 1 -type d | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
 (( second_backup_count > first_backup_count )) || fail "idempotent reinstall did not preserve a new backup"
+
+fixture_package_file="$fixture_home/.local/lib/shanghaitech-shvpn/python-packages/playwright/sync_api.py"
+/bin/cp -p "$fixture_package_file" "$test_tmp/pre-uninstall-sync-api.py"
+print -r -- '# tampered before uninstall' >>"$fixture_package_file"
+set +e
+HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/uninstall.zsh" >/dev/null 2>"$test_tmp/uninstall-tampered-runtime.err"
+uninstall_runtime_rc=$?
+set -e
+[[ "$uninstall_runtime_rc" == 2 ]] || fail "uninstall modified login runtime returned $uninstall_runtime_rc instead of 2"
+[[ -f "$manifest_path" ]] || fail "failed login-runtime uninstall consumed the manifest"
+/usr/bin/install -m 600 "$test_tmp/pre-uninstall-sync-api.py" "$fixture_package_file"
 
 /bin/cp -p "$fixture_home/.ssh/config" "$test_tmp/installed-ssh-config"
 client_before="$(/usr/bin/shasum -a 256 "$fixture_home/.local/bin/zju-connect" | /usr/bin/awk '{print $1}')"
@@ -872,7 +1015,7 @@ HOME="$interrupted_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-
 interrupted_manifest="$interrupted_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv"
 /usr/bin/awk -F '\t' -v OFS='\t' '
   $1 == "format" { $2="1" }
-  $1 == "config-helper" || $1 == "uninstall-helper" { next }
+  $1 == "config-helper" || $1 == "uninstall-helper" || $1 ~ /^login-/ { next }
   { print }
 ' "$interrupted_manifest" >"$test_tmp/interrupted-format1-manifest"
 /usr/bin/install -m 600 "$test_tmp/interrupted-format1-manifest" "$interrupted_manifest"

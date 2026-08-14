@@ -14,7 +14,7 @@
 
 ## 要求与安装
 
-目前支持 macOS 12+、Apple Silicon（`Darwin/arm64`），需要 Git、zsh、OpenSSH、`codesign`、`nc` 和 **Go 1.25.6 darwin/arm64**。安装不使用 `sudo`，也不代装 Homebrew 或 Go。
+目前支持 macOS 12+、Apple Silicon（`Darwin/arm64`），需要 Git、zsh、OpenSSH、`codesign`、`nc`、**Go 1.25.6 darwin/arm64**、**Python 3.10–3.14（含 pip）**和 **Google Chrome**。安装不使用 `sudo`，也不代装这些依赖。
 
 ```zsh
 uname -m
@@ -24,7 +24,7 @@ cd shanghaitech-shvpn
 ./install.zsh
 ```
 
-安装器只询问至少一个需要代理的服务器地址，不询问 alias、用户名、端口、密码、验证码、私钥或 callback URL。安装后新开终端，首次或登录过期时运行 `shvpn login`，之后运行 `shvpn` 即可后台启动。
+安装器只询问至少一个需要代理的服务器地址，不询问 alias、用户名、端口、密码、验证码、私钥或 callback URL。安装后新开终端，首次或登录过期时运行 `shvpn login`：它会打开独立的 Chrome 登录窗口，自动捕获并安全提交 CAS callback，成功后自动切换到后台 VPN。以后运行 `shvpn` 即可复用登录状态。
 
 非交互安装：
 
@@ -43,7 +43,7 @@ cd shanghaitech-shvpn
 |---|---|
 | `shvpn` | 后台启动 VPN，等同于 `shvpn start` |
 | `shvpn start` | 后台启动；已有可信实例时安全地保持不变 |
-| `shvpn login` | 首次登录或认证过期时进入浏览器 CAS 流程 |
+| `shvpn login` | 打开专用 Chrome 窗口完成 CAS，自动处理 callback 并后台启动 VPN |
 | `shvpn status` | 检查 VPN 是否可信运行、停止或处于不可信状态 |
 | `shvpn stop` | 只向已验证属于本项目的 VPN 进程发送 `SIGINT` |
 | `shvpn add HOST_OR_ALIAS` | 添加一个服务器地址，或解析一个现有 SSH alias 后添加其最终 `HostName` |
@@ -104,11 +104,13 @@ ssh gpu
 
 ## 登录、安全与恢复
 
-`shvpn` 会复用已保存的登录状态。首次使用、状态过期或学校要求重新验证时，运行 `shvpn login`，亲自在浏览器完成 CAS/手机验证并按终端提示处理 callback URL。本项目不保存或自动填写短信验证码。
+`shvpn` 会复用已保存的登录状态。首次使用、状态过期或学校要求重新验证时，运行 `shvpn login`，亲自在专用 Chrome 窗口完成 CAS；无需复制、查看或粘贴 callback URL。若学校要求短信验证，终端会关闭回显后读取验证码，本项目不会保存或自动填写验证码。
+
+自动登录使用锁定哈希的 Playwright 1.62.0 Python 包，但不会下载 Playwright 自带浏览器；只调用本机 Google Chrome。CAS 登录复用状态保存在 `~/Library/Application Support/ShanghaitechVPN/cas-chrome-profile/`，与日常 Chrome 配置隔离，且卸载时默认保留，避免每次重新登录。该目录可能含有效 SSO 状态，不要复制、同步或公开。
 
 安装、`add/remove`、VPN 生命周期和卸载使用同一非阻塞配置锁；并发操作返回 `75`。托管文件按哈希校验，所有配置写入前保存时间戳备份到 `~/.local/lib/shanghaitech-shvpn/backups/`。发现符号链接、所有者异常、哈希变化、SSH 冲突或标记歧义时会在写入前失败关闭（fail closed）。
 
-普通错误会自动回滚。极端的断电或 `SIGKILL` 可能留下已备份但未完成的多文件更新；此时不要手工猜测清单，使用仓库中的 `./uninstall.zsh` 恢复/退役受信安装，再重新安装。旧格式迁移中出现未被清单记录的 helper 也采用同一恢复方式。
+普通错误会自动回滚。极端的断电或 `SIGKILL` 可能留下已备份但未完成的多文件更新；此时不要手工猜测清单，使用仓库中的 `./uninstall.zsh` 恢复/退役受信安装，再重新安装。旧格式迁移中出现未被清单记录的 helper 或登录运行时也采用同一恢复方式。
 
 `shvpn uninstall` 不删除 `client-data.json`、日志或卸载恢复归档，也绝不会停止占用 SOCKS 端口的无关进程。若命令内卸载不可用，可在仓库目录运行 `./uninstall.zsh`。
 

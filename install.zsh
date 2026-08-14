@@ -30,6 +30,45 @@ sha_file() {
   REPLY="$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}')" || return 1
 }
 
+safe_login_python() {
+  local python_bin="$1"
+  local resolved mode owner permission
+  [[ -x "$python_bin" ]] || return 1
+  resolved="${python_bin:A}"
+  [[ -f "$resolved" && -x "$resolved" && ! -L "$resolved" ]] || return 1
+  owner="$(/usr/bin/stat -f %u "$resolved" 2>/dev/null)" || return 1
+  [[ "$owner" == 0 || "$owner" == "$current_uid" ]] || return 1
+  mode="$(/usr/bin/stat -f %Lp "$resolved" 2>/dev/null)" || return 1
+  [[ "$mode" == <-> ]] || return 1
+  permission=$(( 8#$mode ))
+  (( (permission & 8#022) == 0 ))
+}
+
+discover_login_python() {
+  local found="" candidate version
+  local -a candidates
+  local -A seen
+  command -v python3 >/dev/null 2>&1 && found="$(command -v python3)"
+  candidates=(/opt/homebrew/bin/python3 /usr/local/bin/python3 "$found")
+  for version in 3.14 3.13 3.12 3.11 3.10; do
+    command -v "python$version" >/dev/null 2>&1 && candidates+=("$(command -v "python$version")")
+  done
+  for candidate in "${candidates[@]}"; do
+    [[ -n "$candidate" && -z "${seen[$candidate]:-}" ]] || continue
+    seen[$candidate]=1
+    safe_login_python "$candidate" || continue
+    version="$("$candidate" -I -B -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)" || continue
+    [[ "$version" == 3.(10|11|12|13|14) ]] || continue
+    "$candidate" -I -B -m pip --version >/dev/null 2>&1 || continue
+    login_python="$candidate"
+    login_python_version="$version"
+    sha_file "${candidate:A}" || die 74 "cannot hash Python interpreter"
+    login_python_sha="$REPLY"
+    return 0
+  done
+  die 69 "Python 3.10-3.14 with pip is required for automatic CAS login"
+}
+
 safe_regular_or_absent() {
   local file_path="$1"
   if [[ -e "$file_path" || -L "$file_path" ]]; then
@@ -371,6 +410,7 @@ done
 for command_name in zsh git go codesign ssh nc shasum lsof; do
   command -v "$command_name" >/dev/null 2>&1 || die 69 "required command not found: $command_name"
 done
+discover_login_python
 
 home_dir="${HOME:A}"
 [[ -d "$home_dir" && ! -L "$home_dir" && "$home_dir" == /* ]] || die 69 "HOME is not a safe physical directory"
@@ -384,6 +424,9 @@ backup_root="$lib_dir/backups"
 manifest="$lib_dir/install.manifest.tsv"
 config_helper="$lib_dir/configure-targets.zsh"
 uninstall_helper="$lib_dir/uninstall.zsh"
+login_helper="$lib_dir/python-login-helper.py"
+login_requirements="$lib_dir/requirements-login.txt"
+login_packages="$lib_dir/python-packages"
 config_dir="$home_dir/.config/shanghaitech-shvpn"
 targets_file="$config_dir/targets.tsv"
 ssh_dir="$home_dir/.ssh"
@@ -397,7 +440,7 @@ state_dir="$home_dir/Library/Application Support/ShanghaitechVPN"
 config_lock="$state_dir/shvpn.config.lock"
 TAB=$'\t'
 
-for managed_path in "$client" "$launcher" "$shvpn" "$route" "$targets_file" "$ssh_config" "$zshrc" "$manifest" "$config_helper" "$uninstall_helper" "$config_lock"; do
+for managed_path in "$client" "$launcher" "$shvpn" "$route" "$targets_file" "$ssh_config" "$zshrc" "$manifest" "$config_helper" "$uninstall_helper" "$login_helper" "$login_requirements" "$config_lock"; do
   safe_regular_or_absent "$managed_path" || die 69 "refusing unsafe path: $managed_path"
 done
 
@@ -412,7 +455,7 @@ if [[ -f "$manifest" ]]; then
   [[ "$(/usr/bin/stat -f %Lp "$manifest")" == "600" ]] || die 69 "install manifest has unsafe mode"
   manifest_get format "$manifest" || die 65 "invalid install manifest"
   install_format="$REPLY"
-  [[ "$install_format" == "1" || "$install_format" == "2" ]] || die 65 "unsupported install manifest"
+  [[ "$install_format" == "1" || "$install_format" == "2" || "$install_format" == "3" ]] || die 65 "unsupported install manifest"
   manifest_get path-choice "$manifest" || die 65 "invalid install manifest"
   [[ "$REPLY" == "$path_choice" ]] || die 65 "PATH policy changed; run uninstall.zsh before reinstalling"
   for spec in \
@@ -429,7 +472,7 @@ if [[ -f "$manifest" ]]; then
     sha_file "$managed_path" || die 74 "cannot hash managed file: $managed_path"
     [[ "$REPLY" == "$expected_sha" ]] || die 65 "managed file was modified; refusing overwrite: $managed_path"
   done
-  if [[ "$install_format" == "2" ]]; then
+  if [[ "$install_format" == "2" || "$install_format" == "3" ]]; then
     for spec in \
       "config-helper:$config_helper" \
       "uninstall-helper:$uninstall_helper"; do
@@ -445,6 +488,30 @@ if [[ -f "$manifest" ]]; then
   elif [[ -e "$config_helper" || -L "$config_helper" || -e "$uninstall_helper" || -L "$uninstall_helper" ]]; then
     die 65 "incomplete format-1 migration detected; run the repository uninstall.zsh, then reinstall"
   fi
+  if [[ "$install_format" == "3" ]]; then
+    for spec in "login-helper:$login_helper" "login-requirements:$login_requirements"; do
+      key="${spec%%:*}"
+      managed_path="${spec#*:}"
+      [[ -f "$managed_path" && ! -L "$managed_path" ]] || die 65 "managed login file is missing: $managed_path"
+      manifest_get "$key" "$manifest" || die 65 "invalid install manifest entry: $key"
+      expected_sha="$REPLY"
+      sha_file "$managed_path" || die 74 "cannot hash managed login file"
+      [[ "$REPLY" == "$expected_sha" ]] || die 65 "managed login file was modified; refusing overwrite"
+    done
+    [[ -d "$login_packages" && ! -L "$login_packages" && "$(/usr/bin/stat -f %u "$login_packages")" == "$current_uid" ]] || die 65 "managed Python package tree is missing or unsafe"
+    manifest_get login-python "$manifest" || die 65 "missing recorded Python"
+    manifest_get login-python-version "$manifest" || die 65 "missing recorded Python version"
+    manifest_get login-python-sha256 "$manifest" || die 65 "missing recorded Python hash"
+    manifest_get login-packages "$manifest" || die 65 "missing Python package digest"
+    expected_sha="$REPLY"
+    # A Homebrew Python update may invalidate the recorded executable. The
+    # installer is the repair path, so verify the old tree with the newly
+    # discovered trusted interpreter and then record the new interpreter.
+    actual_tree="$("$login_python" -I -B "$login_helper" --tree-digest "$login_packages" 2>/dev/null)" || die 65 "cannot verify managed Python package tree"
+    [[ "$actual_tree" == "$expected_sha" ]] || die 65 "managed Python package tree was modified; refusing overwrite"
+  elif [[ -e "$login_helper" || -L "$login_helper" || -e "$login_requirements" || -L "$login_requirements" || -e "$login_packages" || -L "$login_packages" ]]; then
+    die 65 "incomplete login runtime migration detected; uninstall before reinstalling"
+  fi
 elif [[ -e "$lib_dir" || -L "$lib_dir" ]]; then
   [[ -d "$lib_dir" && ! -L "$lib_dir" ]] || die 69 "unsafe library directory: $lib_dir"
   die 65 "existing unrecognized installation metadata: $lib_dir"
@@ -456,9 +523,15 @@ work_dir="$(/usr/bin/mktemp -d "$temp_parent/shvpn-install.XXXXXX")"
 install_complete=0
 writes_started=0
 fresh_namespace=$(( ! existing_install ))
+package_stage=""
+package_previous=""
+package_installed=0
 cleanup_work() {
   if [[ -n "${work_dir:-}" && -d "$work_dir" && "$work_dir" == "$temp_parent"/shvpn-install.* ]]; then
     /bin/rm -rf -- "$work_dir"
+  fi
+  if [[ -n "${package_stage:-}" && "$package_stage" == "$lib_dir/.python-packages.stage-"* && -d "$package_stage" && ! -L "$package_stage" ]]; then
+    /bin/rm -rf -- "$package_stage"
   fi
 }
 rollback_install() {
@@ -470,10 +543,20 @@ rollback_install() {
   restore_snapshot "$history_dir" shanghaitech-ssh-route "$route" || rollback_failed=1
   restore_snapshot "$history_dir" config-helper "$config_helper" || rollback_failed=1
   restore_snapshot "$history_dir" uninstall-helper "$uninstall_helper" || rollback_failed=1
+  restore_snapshot "$history_dir" login-helper "$login_helper" || rollback_failed=1
+  restore_snapshot "$history_dir" login-requirements "$login_requirements" || rollback_failed=1
   restore_snapshot "$history_dir" targets "$targets_file" || rollback_failed=1
   restore_snapshot "$history_dir" ssh-config "$ssh_config" || rollback_failed=1
   restore_snapshot "$history_dir" zshrc "$zshrc" || rollback_failed=1
   restore_snapshot "$history_dir" manifest "$manifest" || rollback_failed=1
+  if (( package_installed )); then
+    if [[ -d "$login_packages" && ! -L "$login_packages" && "$login_packages" == "$lib_dir/python-packages" ]]; then
+      /bin/rm -rf -- "$login_packages" || rollback_failed=1
+    fi
+    if [[ -n "$package_previous" && -d "$package_previous" && ! -L "$package_previous" && "$package_previous" == "$lib_dir/.python-packages.previous-"* ]]; then
+      /bin/mv "$package_previous" "$login_packages" || rollback_failed=1
+    fi
+  fi
   (( rollback_failed == 0 )) || say_error "install: automatic rollback was incomplete; inspect $history_dir"
   return "$rollback_failed"
 }
@@ -515,6 +598,9 @@ quote_for_zsh "$config_helper"; config_helper_q="$REPLY"
 quote_for_zsh "$uninstall_helper"; uninstall_helper_q="$REPLY"
 quote_for_zsh "$config_lock"; config_lock_q="$REPLY"
 quote_for_zsh "$backup_root"; backup_root_q="$REPLY"
+quote_for_zsh "$login_helper"; login_helper_q="$REPLY"
+quote_for_zsh "$login_requirements"; login_requirements_q="$REPLY"
+quote_for_zsh "$login_packages"; login_packages_q="$REPLY"
 route_proxy="$route_command_q %h %p"
 quote_for_zsh "$route_proxy"; route_proxy_q="$REPLY"
 
@@ -537,6 +623,9 @@ content="${content//@@MANIFEST_Q@@/$manifest_q}"
 content="${content//@@CONFIG_HELPER_Q@@/$config_helper_q}"
 content="${content//@@UNINSTALL_HELPER_Q@@/$uninstall_helper_q}"
 content="${content//@@CONFIG_LOCK_Q@@/$config_lock_q}"
+content="${content//@@LOGIN_HELPER_Q@@/$login_helper_q}"
+content="${content//@@LOGIN_REQUIREMENTS_Q@@/$login_requirements_q}"
+content="${content//@@LOGIN_PACKAGES_Q@@/$login_packages_q}"
 [[ "$content" != *'@@'* ]] || die 65 "unresolved shvpn template token"
 print -rn -- "$content" >"$work_dir/shvpn"
 
@@ -553,6 +642,8 @@ content="${content//@@BACKUP_ROOT_Q@@/$backup_root_q}"
 print -rn -- "$content" >"$work_dir/configure-targets.zsh"
 
 /bin/cp "$project_root/uninstall.zsh" "$work_dir/uninstall.zsh" || die 74 "cannot prepare uninstall helper"
+/bin/cp "$project_root/libexec/python-login-helper.py" "$work_dir/python-login-helper.py" || die 74 "cannot prepare login helper"
+/bin/cp "$project_root/requirements-login.txt" "$work_dir/requirements-login.txt" || die 74 "cannot prepare login dependency lock"
 
 content="$(<"$project_root/libexec/shanghaitech-ssh-route.zsh")"
 content="${content//@@SHVPN_Q@@/$shvpn_q}"
@@ -560,8 +651,10 @@ content="${content//@@TARGETS_Q@@/$targets_q}"
 [[ "$content" != *'@@'* ]] || die 65 "unresolved route template token"
 print -rn -- "$content" >"$work_dir/shanghaitech-ssh-route"
 
-/bin/chmod 700 "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route" "$work_dir/configure-targets.zsh" "$work_dir/uninstall.zsh"
+/bin/chmod 700 "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route" "$work_dir/configure-targets.zsh" "$work_dir/uninstall.zsh" "$work_dir/python-login-helper.py"
+/bin/chmod 600 "$work_dir/requirements-login.txt"
 /bin/zsh -n "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route" "$work_dir/configure-targets.zsh" "$work_dir/uninstall.zsh" || die 65 "rendered helper syntax check failed"
+"$login_python" -I -B -m py_compile "$work_dir/python-login-helper.py" || die 65 "login helper syntax check failed"
 
 : >"$work_dir/targets.tsv"
 : >"$work_dir/ssh.block"
@@ -673,6 +766,12 @@ ensure_private_dir "$config_dir"
 ensure_owned_dir "$ssh_dir"
 ensure_private_dir "$state_dir"
 
+package_stage="$lib_dir/.python-packages.stage-$$"
+[[ ! -e "$package_stage" && ! -L "$package_stage" ]] || die 65 "unexpected Python package staging path"
+"$project_root/libexec/build-login-runtime.zsh" "$login_python" "$work_dir/requirements-login.txt" "$package_stage" || die 74 "cannot build automatic login runtime"
+login_packages_sha="$("$login_python" -I -B "$work_dir/python-login-helper.py" --tree-digest "$package_stage" 2>/dev/null)" || die 65 "cannot hash automatic login runtime"
+[[ "$login_packages_sha" == [0-9a-f](#c64) ]] || die 65 "invalid automatic login runtime digest"
+
 if (( ! existing_install )); then
   baseline_stage="$work_dir/baseline"
   /usr/bin/install -d -m 700 "$baseline_stage"
@@ -699,6 +798,8 @@ snapshot_path "$history_dir" shvpn "$shvpn"
 snapshot_path "$history_dir" shanghaitech-ssh-route "$route"
 snapshot_path "$history_dir" config-helper "$config_helper"
 snapshot_path "$history_dir" uninstall-helper "$uninstall_helper"
+snapshot_path "$history_dir" login-helper "$login_helper"
+snapshot_path "$history_dir" login-requirements "$login_requirements"
 snapshot_path "$history_dir" targets "$targets_file"
 snapshot_path "$history_dir" ssh-config "$ssh_config"
 snapshot_path "$history_dir" zshrc "$zshrc"
@@ -712,6 +813,17 @@ atomic_install "$work_dir/shvpn" "$shvpn" 755 || die 74 "cannot install shvpn"
 atomic_install "$work_dir/shanghaitech-ssh-route" "$route" 755 || die 74 "cannot install route helper"
 atomic_install "$work_dir/configure-targets.zsh" "$config_helper" 700 || die 74 "cannot install configuration helper"
 atomic_install "$work_dir/uninstall.zsh" "$uninstall_helper" 700 || die 74 "cannot install uninstall helper"
+atomic_install "$work_dir/python-login-helper.py" "$login_helper" 700 || die 74 "cannot install automatic login helper"
+atomic_install "$work_dir/requirements-login.txt" "$login_requirements" 600 || die 74 "cannot install login dependency lock"
+if [[ -d "$login_packages" && ! -L "$login_packages" ]]; then
+  package_previous="$lib_dir/.python-packages.previous-$$"
+  [[ ! -e "$package_previous" && ! -L "$package_previous" ]] || die 65 "unexpected Python package rollback path"
+  /bin/mv "$login_packages" "$package_previous" || die 74 "cannot stage previous Python package tree"
+  package_installed=1
+fi
+/bin/mv "$package_stage" "$login_packages" || die 74 "cannot install Python package tree"
+package_stage=""
+package_installed=1
 atomic_install "$work_dir/targets.tsv" "$targets_file" 600 || die 74 "cannot install target allowlist"
 atomic_install "$work_dir/ssh.config" "$ssh_config" 600 || die 74 "cannot install SSH config"
 if [[ "$path_choice" == "add" ]]; then
@@ -725,6 +837,8 @@ for spec in \
   "shanghaitech-ssh-route:$route" \
   "config-helper:$config_helper" \
   "uninstall-helper:$uninstall_helper" \
+  "login-helper:$login_helper" \
+  "login-requirements:$login_requirements" \
   "targets:$targets_file"; do
   key="${spec%%:*}"
   managed_path="${spec#*:}"
@@ -734,9 +848,13 @@ done
 sha_file "$work_dir/ssh.block"; ssh_block_sha="$REPLY"
 sha_file "$ssh_config"; ssh_full_sha="$REPLY"
 {
-  print -r -- "format${TAB}2"
+  print -r -- "format${TAB}3"
   print -r -- "path-choice${TAB}$path_choice"
   /bin/cat "$work_dir/install.manifest.tsv"
+  print -r -- "login-packages${TAB}$login_packages_sha"
+  print -r -- "login-python${TAB}$login_python"
+  print -r -- "login-python-version${TAB}$login_python_version"
+  print -r -- "login-python-sha256${TAB}$login_python_sha"
   print -r -- "ssh-block${TAB}$ssh_block_sha"
   print -r -- "ssh-full${TAB}$ssh_full_sha"
   if [[ "$path_choice" == "add" ]]; then
@@ -752,10 +870,14 @@ manifest_candidate_sha="$REPLY"
 sha_file "$manifest" || die 74 "cannot verify installed manifest"
 [[ "$REPLY" == "$manifest_candidate_sha" ]] || die 74 "installed manifest verification failed"
 
+if [[ -n "$package_previous" && -d "$package_previous" && ! -L "$package_previous" && "$package_previous" == "$lib_dir/.python-packages.previous-"* ]]; then
+  /bin/rm -rf -- "$package_previous" || die 74 "cannot remove previous Python package tree"
+  package_previous=""
+fi
 install_complete=1
 print -r -- "安装完成。新开一个终端后可以使用："
 if [[ "$path_choice" == "add" ]]; then
-  print -r -- "  shvpn login    # 首次登录或登录过期时"
+  print -r -- "  shvpn login    # 专用 Chrome 自动完成 callback 并后台启动"
   print -r -- "  shvpn          # 后台启动"
   print -r -- "  shvpn status"
   print -r -- "  shvpn doctor"
@@ -765,7 +887,7 @@ if [[ "$path_choice" == "add" ]]; then
   print -r -- "  shvpn stop"
   print -r -- "  shvpn uninstall"
 else
-  print -r -- "  $shvpn login"
+  print -r -- "  $shvpn login    # 专用 Chrome 自动完成 callback 并后台启动"
   print -r -- "  $shvpn"
   print -r -- "  $shvpn status"
   print -r -- "  $shvpn doctor"

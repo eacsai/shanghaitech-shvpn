@@ -268,7 +268,7 @@ verify_manifest_and_state() {
   mode="$(/usr/bin/stat -f %Lp "$manifest")" || die 74 "cannot inspect install manifest"
   [[ "$mode" == "600" ]] || die 69 "install manifest mode is unsafe"
   manifest_get format || die 65 "invalid install manifest"
-  [[ "$REPLY" == "2" ]] || die 65 "dynamic target management requires install manifest format 2; reinstall shvpn"
+  [[ "$REPLY" == "3" ]] || die 65 "dynamic target management requires install manifest format 3; reinstall shvpn"
   for key in config-helper shanghaitech-ssh-route targets; do
     manifest_get "$key" || die 65 "missing install manifest entry: $key"
     expected="$REPLY"

@@ -33,6 +33,24 @@ safe_regular_or_absent() {
   return 0
 }
 
+safe_owned_dir() {
+  [[ -d "$1" && ! -L "$1" && "$(/usr/bin/stat -f %u "$1" 2>/dev/null)" == "$current_uid" ]]
+}
+
+safe_login_python() {
+  local python_bin="$1"
+  local resolved mode owner permission
+  [[ -x "$python_bin" ]] || return 1
+  resolved="${python_bin:A}"
+  [[ -f "$resolved" && -x "$resolved" && ! -L "$resolved" ]] || return 1
+  owner="$(/usr/bin/stat -f %u "$resolved" 2>/dev/null)" || return 1
+  [[ "$owner" == 0 || "$owner" == "$current_uid" ]] || return 1
+  mode="$(/usr/bin/stat -f %Lp "$resolved" 2>/dev/null)" || return 1
+  [[ "$mode" == <-> ]] || return 1
+  permission=$(( 8#$mode ))
+  (( (permission & 8#022) == 0 ))
+}
+
 manifest_get() {
   local key="$1"
   local manifest_file="$2"
@@ -165,6 +183,9 @@ shvpn="$bin_dir/shvpn"
 route="$bin_dir/shanghaitech-ssh-route"
 config_helper="$lib_dir/configure-targets.zsh"
 uninstall_helper="$lib_dir/uninstall.zsh"
+login_helper="$lib_dir/python-login-helper.py"
+login_requirements="$lib_dir/requirements-login.txt"
+login_packages="$lib_dir/python-packages"
 state_dir="$home_dir/Library/Application Support/ShanghaitechVPN"
 config_lock="$state_dir/shvpn.config.lock"
 
@@ -173,7 +194,7 @@ config_lock="$state_dir/shvpn.config.lock"
 [[ -d "$baseline_dir" && ! -L "$baseline_dir" && -f "$baseline_dir/COMPLETE" ]] || die 65 "baseline metadata is incomplete"
 manifest_get format "$manifest" || die 65 "invalid install manifest"
 install_format="$REPLY"
-[[ "$install_format" == "1" || "$install_format" == "2" ]] || die 65 "unsupported install manifest"
+[[ "$install_format" == "1" || "$install_format" == "2" || "$install_format" == "3" ]] || die 65 "unsupported install manifest"
 manifest_get path-choice "$manifest" || die 65 "invalid PATH policy in manifest"
 path_choice="$REPLY"
 [[ "$path_choice" == "add" || "$path_choice" == "none" ]] || die 65 "invalid PATH policy in manifest"
@@ -181,11 +202,17 @@ path_choice="$REPLY"
 for managed_path in "$client" "$launcher" "$shvpn" "$route" "$targets_file" "$ssh_config" "$zshrc" "$config_lock"; do
   safe_regular_or_absent "$managed_path" || die 69 "unsafe managed path: $managed_path"
 done
-if [[ "$install_format" == "2" ]]; then
+if [[ "$install_format" == "2" || "$install_format" == "3" ]]; then
   for managed_path in "$config_helper" "$uninstall_helper"; do
     safe_regular_or_absent "$managed_path" || die 69 "unsafe managed helper: $managed_path"
     [[ ! -f "$managed_path" || "$(/usr/bin/stat -f %Lp "$managed_path")" == "700" ]] || die 69 "managed helper has unsafe mode: $managed_path"
   done
+fi
+if [[ "$install_format" == "3" ]]; then
+  for managed_path in "$login_helper" "$login_requirements"; do
+    safe_regular_or_absent "$managed_path" || die 69 "unsafe managed login file: $managed_path"
+  done
+  safe_owned_dir "$login_packages" || die 69 "unsafe managed Python package tree"
 fi
 
 temp_parent="${TMPDIR:-/tmp}"
@@ -261,9 +288,34 @@ run_preflight() {
   preflight_file shvpn "$shvpn"
   preflight_file shanghaitech-ssh-route "$route"
   preflight_file targets "$targets_file"
-  if [[ "$install_format" == "2" ]]; then
+  if [[ "$install_format" == "2" || "$install_format" == "3" ]]; then
     preflight_file config-helper "$config_helper"
     preflight_file uninstall-helper "$uninstall_helper"
+  fi
+  if [[ "$install_format" == "3" ]]; then
+    preflight_file login-helper "$login_helper"
+    preflight_file login-requirements "$login_requirements"
+    if (( preflight_failed != 0 )); then
+      return 1
+    fi
+    manifest_get login-python "$manifest" || die 65 "missing recorded Python"
+    login_python="$REPLY"
+    safe_login_python "$login_python" || die 69 "recorded Python is unavailable or unsafe"
+    manifest_get login-python-version "$manifest" || die 65 "missing recorded Python version"
+    expected_python_version="$REPLY"
+    actual_python_version="$("$login_python" -I -B -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)" || die 69 "cannot inspect recorded Python"
+    [[ "$actual_python_version" == "$expected_python_version" ]] || die 69 "recorded Python version changed"
+    manifest_get login-python-sha256 "$manifest" || die 65 "missing recorded Python hash"
+    expected_python_sha="$REPLY"
+    sha_file "${login_python:A}" || die 74 "cannot hash recorded Python"
+    [[ "$REPLY" == "$expected_python_sha" ]] || die 69 "recorded Python executable changed"
+    manifest_get login-packages "$manifest" || die 65 "missing Python package digest"
+    expected_packages_sha="$REPLY"
+    actual_packages_sha="$("$login_python" -I -B "$login_helper" --tree-digest "$login_packages" 2>/dev/null)" || die 69 "cannot verify Python package tree"
+    if [[ "$actual_packages_sha" != "$expected_packages_sha" ]]; then
+      say_error "uninstall: managed Python package tree was modified"
+      preflight_failed=1
+    fi
   fi
   preflight_block ssh-block ssh-full "$ssh_config" "$begin_ssh" "$end_ssh" ssh
   if [[ "$path_choice" == "add" ]]; then

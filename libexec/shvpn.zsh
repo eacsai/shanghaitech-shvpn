@@ -16,6 +16,9 @@ typeset -gr manifest=@@MANIFEST_Q@@
 typeset -gr config_helper=@@CONFIG_HELPER_Q@@
 typeset -gr uninstall_helper=@@UNINSTALL_HELPER_Q@@
 typeset -gr config_lock_file=@@CONFIG_LOCK_Q@@
+typeset -gr login_helper=@@LOGIN_HELPER_Q@@
+typeset -gr login_requirements=@@LOGIN_REQUIREMENTS_Q@@
+typeset -gr login_packages=@@LOGIN_PACKAGES_Q@@
 typeset -gr ssh_root="${ssh_config:h}"
 typeset -gr ssh_client="/usr/bin/ssh"
 typeset -gr client_data="$state_dir/client-data.json"
@@ -59,6 +62,20 @@ safe_owned_executable() {
   safe_owned_regular "$1" && [[ -x "$1" ]]
 }
 
+safe_login_python() {
+  local python_bin="$1"
+  local resolved mode owner permission
+  [[ -x "$python_bin" ]] || return 1
+  resolved="${python_bin:A}"
+  [[ -f "$resolved" && -x "$resolved" && ! -L "$resolved" ]] || return 1
+  owner="$(/usr/bin/stat -f %u "$resolved" 2>/dev/null)" || return 1
+  [[ "$owner" == 0 || "$owner" == "$current_uid" ]] || return 1
+  mode="$(/usr/bin/stat -f %Lp "$resolved" 2>/dev/null)" || return 1
+  [[ "$mode" == <-> ]] || return 1
+  permission=$(( 8#$mode ))
+  (( (permission & 8#022) == 0 ))
+}
+
 sha_file() {
   REPLY="$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}')" || return 1
 }
@@ -85,8 +102,8 @@ verify_installed_helper() {
     return 69
   fi
   manifest_get format || { say_error "shvpn: invalid install manifest"; return 65; }
-  if [[ "$REPLY" != "2" ]]; then
-    say_error "shvpn: this command requires install manifest format 2; reinstall shvpn"
+  if [[ "$REPLY" != "3" ]]; then
+    say_error "shvpn: this command requires install manifest format 3; reinstall shvpn"
     return 65
   fi
   if ! safe_owned_executable "$helper"; then
@@ -105,6 +122,44 @@ verify_installed_helper() {
     say_error "shvpn: managed helper was modified; refusing: $helper"
     return 2
   fi
+  return 0
+}
+
+verify_login_runtime() {
+  local key expected python_bin python_version python_sha actual_version actual_sha actual_tree mode
+  safe_owned_regular "$manifest" || { say_error "shvpn: install manifest is missing or unsafe"; return 69; }
+  mode="$(/usr/bin/stat -f %Lp "$manifest" 2>/dev/null)" || return 69
+  [[ "$mode" == "600" ]] || { say_error "shvpn: install manifest mode is unsafe"; return 69; }
+  manifest_get format || return 65
+  [[ "$REPLY" == "3" ]] || { say_error "shvpn: automatic login requires reinstalling shvpn"; return 65; }
+
+  for key in login-helper login-requirements; do
+    case "$key" in
+      login-helper) safe_owned_regular "$login_helper" && [[ "$(/usr/bin/stat -f %Lp "$login_helper")" == "700" ]] || { say_error "shvpn: automatic login helper is missing or unsafe"; return 69; }; sha_file "$login_helper" ;;
+      login-requirements) safe_owned_regular "$login_requirements" && [[ "$(/usr/bin/stat -f %Lp "$login_requirements")" == "600" ]] || { say_error "shvpn: login dependency lock is missing or unsafe"; return 69; }; sha_file "$login_requirements" ;;
+    esac || return 74
+    actual_sha="$REPLY"
+    manifest_get "$key" || return 65
+    [[ "$actual_sha" == "$REPLY" ]] || { say_error "shvpn: managed $key was modified; refusing"; return 2; }
+  done
+
+  manifest_get login-python || return 65
+  python_bin="$REPLY"
+  manifest_get login-python-version || return 65
+  python_version="$REPLY"
+  manifest_get login-python-sha256 || return 65
+  python_sha="$REPLY"
+  safe_login_python "$python_bin" || { say_error "shvpn: recorded Python interpreter is unavailable or unsafe; reinstall shvpn"; return 69; }
+  actual_version="$("$python_bin" -I -B -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)" || return 69
+  [[ "$actual_version" == "$python_version" ]] || { say_error "shvpn: recorded Python version changed; reinstall shvpn"; return 69; }
+  sha_file "${python_bin:A}" || return 74
+  [[ "$REPLY" == "$python_sha" ]] || { say_error "shvpn: recorded Python executable changed; reinstall shvpn"; return 69; }
+  [[ -d "$login_packages" && ! -L "$login_packages" && "$(/usr/bin/stat -f %u "$login_packages" 2>/dev/null)" == "$current_uid" ]] || { say_error "shvpn: managed Python packages are missing or unsafe"; return 69; }
+  actual_tree="$("$python_bin" -I -B "$login_helper" --tree-digest "$login_packages" 2>/dev/null)" || { say_error "shvpn: managed Python package tree is unsafe"; return 69; }
+  manifest_get login-packages || return 65
+  [[ "$actual_tree" == "$REPLY" ]] || { say_error "shvpn: managed Python package tree was modified; refusing"; return 2; }
+  "$python_bin" -I -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import playwright.sync_api' "$login_packages" >/dev/null 2>&1 || { say_error "shvpn: managed Playwright runtime cannot be imported"; return 69; }
+  REPLY="$python_bin"
   return 0
 }
 
@@ -262,16 +317,18 @@ resolve_ssh_name() {
 }
 
 prepare_ssh_diagnostics() {
-  local file_path mode permission
+  local spec label file_path mode permission
 
-  for file_path in "$client" "$launcher" "$self" "$route"; do
+  for spec in "VPN client:$client" "VPN launcher:$launcher" "shvpn command:$self" "SSH route helper:$route"; do
+    label="${spec%%:*}"
+    file_path="${spec#*:}"
     if ! safe_owned_executable "$file_path"; then
-      say_error "shvpn: managed executable is missing or unsafe: $file_path"
+      say_error "shvpn: managed $label is missing or unsafe"
       return 2
     fi
   done
   if ! safe_owned_regular "$ssh_config"; then
-    say_error "shvpn: SSH config is missing or unsafe: $ssh_config"
+    say_error "shvpn: SSH config is missing or unsafe"
     return 2
   fi
   mode="$(/usr/bin/stat -f %Lp "$ssh_config" 2>/dev/null)" || return 2
@@ -363,6 +420,17 @@ doctor_shvpn() {
   typeset -g doctor_warnings=0
 
   prepare_ssh_diagnostics || return $?
+  if verify_login_runtime; then
+    print -r -- "doctor: automatic CAS login runtime OK."
+  else
+    doctor_failures=$(( doctor_failures + 1 ))
+  fi
+  if [[ -d "/Applications/Google Chrome.app" ]]; then
+    print -r -- "doctor: Google Chrome detected."
+  else
+    say_error "doctor: warning: Google Chrome is not installed; 'shvpn login' needs Chrome"
+    doctor_warnings=$(( doctor_warnings + 1 ))
+  fi
   collect_candidate_ssh_names "$@" || return $?
 
   show_status
@@ -893,7 +961,7 @@ stop_vpn() {
 }
 
 login_vpn() {
-  local pid rc
+  local pid rc python_bin
 
   get_listener_pid
   rc=$?
@@ -910,7 +978,14 @@ login_vpn() {
     return 2
   fi
 
-  "$launcher"
+  verify_login_runtime || return $?
+  python_bin="$REPLY"
+  print -r -- "shvpn: opening the dedicated ShanghaiTech CAS login window..."
+  "$python_bin" -I -B "$login_helper" \
+    --package-dir "$login_packages" \
+    --launcher "$launcher" \
+    --state-dir "$state_dir" || return $?
+  start_vpn
   return $?
 }
 

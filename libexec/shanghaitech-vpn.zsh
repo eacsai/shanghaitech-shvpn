@@ -29,10 +29,6 @@ if /usr/bin/nc -z -w 1 127.0.0.1 11080 >/dev/null 2>&1; then
   exit 1
 fi
 
-print "When prompted, open the CAS URL printed below in your browser."
-print "After login, copy the complete callback URL from the browser, paste it at"
-print "'Please enter the callback url:', and press Return."
-
 "$client" \
   -protocol atrust \
   -server vpn.shanghaitech.edu.cn \
