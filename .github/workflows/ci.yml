@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  macos:
     runs-on: macos-14
     timeout-minutes: 30
     steps:
@@ -30,3 +30,32 @@ jobs:
         env:
           SHVPN_RUN_UPSTREAM: '1'
         run: /bin/zsh tests/test.zsh
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+          check-latest: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Linux runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh openssh-client lsof netcat-openbsd
+      - name: Verify Linux toolchain
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          test "$(go version)" = "go version go1.25.6 linux/amd64"
+          command -v google-chrome || command -v google-chrome-stable
+      - name: Run Linux installation integration gates
+        run: /usr/bin/zsh tests/test_linux.zsh
+      - name: Build and execute the pinned native Linux client
+        run: |
+          /usr/bin/zsh libexec/build-client.zsh "$RUNNER_TEMP/zju-connect"
+          test "$("$RUNNER_TEMP/zju-connect" -version)" = "ZJU Connect v1.2.2-shanghaitech-nodefix1"

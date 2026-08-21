@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 
 set -eu
 setopt extendedglob
@@ -8,8 +8,37 @@ typeset -gr begin_ssh="# >>> shanghaitech-shvpn managed SSH targets >>>"
 typeset -gr end_ssh="# <<< shanghaitech-shvpn managed SSH targets <<<"
 typeset -gr begin_path="# >>> shanghaitech-shvpn managed PATH >>>"
 typeset -gr end_path="# <<< shanghaitech-shvpn managed PATH <<<"
-typeset -gr current_uid="$(/usr/bin/id -u)"
 typeset -g config_lock_fd
+
+resolve_command() {
+  REPLY="$(command -v -- "$1" 2>/dev/null)" || return 1
+  [[ "$REPLY" == /* && -x "$REPLY" ]]
+  REPLY="${REPLY:A}"
+}
+
+resolve_command uname || { print -u2 -r -- "uninstall: required command not found: uname"; exit 69; }
+uname_bin="$REPLY"
+resolve_command id || { print -u2 -r -- "uninstall: required command not found: id"; exit 69; }
+id_bin="$REPLY"
+resolve_command stat || { print -u2 -r -- "uninstall: required command not found: stat"; exit 69; }
+stat_bin="$REPLY"
+
+os_name="$("$uname_bin" -s)"
+machine_name="$("$uname_bin" -m)"
+case "$os_name:$machine_name" in
+  Darwin:arm64) platform_id="darwin-arm64" ;;
+  Linux:x86_64|Linux:amd64) platform_id="linux-amd64" ;;
+  Linux:aarch64|Linux:arm64) platform_id="linux-arm64" ;;
+  *) print -u2 -r -- "uninstall: supported platforms are Apple Silicon macOS, Linux amd64, and Linux arm64"; exit 69 ;;
+esac
+
+if [[ "$os_name" == "Darwin" ]]; then
+  resolve_command shasum || { print -u2 -r -- "uninstall: required command not found: shasum"; exit 69; }
+else
+  resolve_command sha256sum || { print -u2 -r -- "uninstall: required command not found: sha256sum"; exit 69; }
+fi
+sha_bin="$REPLY"
+typeset -gr current_uid="$("$id_bin" -u)"
 
 say_error() {
   print -u2 -r -- "$*"
@@ -21,20 +50,46 @@ die() {
 }
 
 sha_file() {
-  REPLY="$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}')" || return 1
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$sha_bin" -a 256 -- "$1" | /usr/bin/awk '{print $1}')" || return 1
+  else
+    REPLY="$("$sha_bin" -- "$1" | /usr/bin/awk '{print $1}')" || return 1
+  fi
+  [[ "$REPLY" == [0-9a-f](#c64) ]]
+}
+
+stat_uid() {
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$stat_bin" -f %u -- "$1" 2>/dev/null)" || return 1
+  else
+    REPLY="$("$stat_bin" -c %u -- "$1" 2>/dev/null)" || return 1
+  fi
+  [[ "$REPLY" == <-> ]]
+}
+
+stat_mode() {
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$stat_bin" -f %Lp -- "$1" 2>/dev/null)" || return 1
+  else
+    REPLY="$("$stat_bin" -c %a -- "$1" 2>/dev/null)" || return 1
+  fi
+  [[ "$REPLY" == <-> ]]
 }
 
 safe_regular_or_absent() {
   local file_path="$1"
   if [[ -e "$file_path" || -L "$file_path" ]]; then
     [[ -f "$file_path" && ! -L "$file_path" ]] || return 1
-    [[ "$(/usr/bin/stat -f %u "$file_path" 2>/dev/null)" == "$current_uid" ]] || return 1
+    stat_uid "$file_path" || return 1
+    [[ "$REPLY" == "$current_uid" ]] || return 1
   fi
   return 0
 }
 
 safe_owned_dir() {
-  [[ -d "$1" && ! -L "$1" && "$(/usr/bin/stat -f %u "$1" 2>/dev/null)" == "$current_uid" ]]
+  [[ -d "$1" && ! -L "$1" ]] || return 1
+  stat_uid "$1" || return 1
+  [[ "$REPLY" == "$current_uid" ]]
 }
 
 safe_login_python() {
@@ -43,9 +98,11 @@ safe_login_python() {
   [[ -x "$python_bin" ]] || return 1
   resolved="${python_bin:A}"
   [[ -f "$resolved" && -x "$resolved" && ! -L "$resolved" ]] || return 1
-  owner="$(/usr/bin/stat -f %u "$resolved" 2>/dev/null)" || return 1
+  stat_uid "$resolved" || return 1
+  owner="$REPLY"
   [[ "$owner" == 0 || "$owner" == "$current_uid" ]] || return 1
-  mode="$(/usr/bin/stat -f %Lp "$resolved" 2>/dev/null)" || return 1
+  stat_mode "$resolved" || return 1
+  mode="$REPLY"
   [[ "$mode" == <-> ]] || return 1
   permission=$(( 8#$mode ))
   (( (permission & 8#022) == 0 ))
@@ -151,7 +208,9 @@ restore_baseline() {
 acquire_config_lock() {
   local lock_dir="${config_lock:h}"
   if [[ -e "$lock_dir" || -L "$lock_dir" ]]; then
-    [[ -d "$lock_dir" && ! -L "$lock_dir" && "$(/usr/bin/stat -f %u "$lock_dir" 2>/dev/null)" == "$current_uid" ]] || die 69 "unsafe state directory: $lock_dir"
+    [[ -d "$lock_dir" && ! -L "$lock_dir" ]] || die 69 "unsafe state directory: $lock_dir"
+    stat_uid "$lock_dir" || die 69 "cannot inspect state directory owner"
+    [[ "$REPLY" == "$current_uid" ]] || die 69 "unsafe state directory: $lock_dir"
   else
     /usr/bin/install -d -m 700 "$lock_dir" || die 74 "cannot create state directory"
   fi
@@ -168,7 +227,8 @@ acquire_config_lock() {
 home_dir="${HOME:A}"
 [[ -d "$home_dir" && ! -L "$home_dir" && "$home_dir" == /* ]] || die 69 "HOME is not a safe physical directory"
 [[ "$home_dir" != *$'\n'* && "$home_dir" != *$'\r'* && "$home_dir" != *$'\t'* && "$home_dir" != *'|'* ]] || die 69 "HOME contains unsupported characters"
-[[ "$(/usr/bin/stat -f %u "$home_dir")" == "$current_uid" ]] || die 69 "HOME is not owned by the current user"
+stat_uid "$home_dir" || die 69 "cannot inspect HOME ownership"
+[[ "$REPLY" == "$current_uid" ]] || die 69 "HOME is not owned by the current user"
 
 bin_dir="$home_dir/.local/bin"
 lib_dir="$home_dir/.local/lib/shanghaitech-shvpn"
@@ -176,7 +236,15 @@ baseline_dir="$lib_dir/baseline"
 manifest="$lib_dir/install.manifest.tsv"
 targets_file="$home_dir/.config/shanghaitech-shvpn/targets.tsv"
 ssh_config="$home_dir/.ssh/config"
-zshrc="$home_dir/.zshrc"
+if [[ "$platform_id" == darwin-* ]]; then
+  zshrc="$home_dir/.zshrc"
+  state_dir="$home_dir/Library/Application Support/ShanghaitechVPN"
+else
+  xdg_state_home="${XDG_STATE_HOME:-$home_dir/.local/state}"
+  [[ "$xdg_state_home" == /* && "$xdg_state_home" != *$'\n'* && "$xdg_state_home" != *$'\r'* && "$xdg_state_home" != *$'\t'* && "$xdg_state_home" != *'|'* ]] || die 69 "XDG_STATE_HOME is unsafe"
+  zshrc="$home_dir/.profile"
+  state_dir="${xdg_state_home:A}/shanghaitech-shvpn"
+fi
 client="$bin_dir/zju-connect"
 launcher="$bin_dir/shanghaitech-vpn"
 shvpn="$bin_dir/shvpn"
@@ -186,15 +254,26 @@ uninstall_helper="$lib_dir/uninstall.zsh"
 login_helper="$lib_dir/python-login-helper.py"
 login_requirements="$lib_dir/requirements-login.txt"
 login_packages="$lib_dir/python-packages"
-state_dir="$home_dir/Library/Application Support/ShanghaitechVPN"
 config_lock="$state_dir/shvpn.config.lock"
 
-[[ -d "$lib_dir" && ! -L "$lib_dir" && "$(/usr/bin/stat -f %u "$lib_dir" 2>/dev/null)" == "$current_uid" ]] || die 69 "trusted installation metadata was not found"
-[[ -f "$manifest" && ! -L "$manifest" && "$(/usr/bin/stat -f %Lp "$manifest")" == "600" ]] || die 69 "trusted install manifest was not found"
+safe_owned_dir "$lib_dir" || die 69 "trusted installation metadata was not found"
+[[ -f "$manifest" && ! -L "$manifest" ]] || die 69 "trusted install manifest was not found"
+stat_mode "$manifest" || die 69 "cannot inspect install manifest mode"
+[[ "$REPLY" == "600" ]] || die 69 "trusted install manifest was not found"
 [[ -d "$baseline_dir" && ! -L "$baseline_dir" && -f "$baseline_dir/COMPLETE" ]] || die 65 "baseline metadata is incomplete"
 manifest_get format "$manifest" || die 65 "invalid install manifest"
 install_format="$REPLY"
-[[ "$install_format" == "1" || "$install_format" == "2" || "$install_format" == "3" ]] || die 65 "unsupported install manifest"
+[[ "$install_format" == "1" || "$install_format" == "2" || "$install_format" == "3" || "$install_format" == "4" ]] || die 65 "unsupported install manifest"
+if [[ "$install_format" == "4" ]]; then
+  manifest_get platform "$manifest" || die 65 "install manifest is missing platform"
+  [[ "$REPLY" == "$platform_id" ]] || die 65 "installation belongs to a different platform: $REPLY"
+  manifest_get state-dir "$manifest" || die 65 "install manifest is missing state directory"
+  [[ "$REPLY" == /* && "$REPLY" != *$'\n'* && "$REPLY" != *$'\r'* && "$REPLY" != *$'\t'* && "$REPLY" != *'|'* ]] || die 65 "install manifest has an unsafe state directory"
+  state_dir="${REPLY:A}"
+  config_lock="$state_dir/shvpn.config.lock"
+elif [[ "$platform_id" != "darwin-arm64" ]]; then
+  die 65 "legacy install manifests are supported only on Apple Silicon macOS"
+fi
 manifest_get path-choice "$manifest" || die 65 "invalid PATH policy in manifest"
 path_choice="$REPLY"
 [[ "$path_choice" == "add" || "$path_choice" == "none" ]] || die 65 "invalid PATH policy in manifest"
@@ -202,13 +281,16 @@ path_choice="$REPLY"
 for managed_path in "$client" "$launcher" "$shvpn" "$route" "$targets_file" "$ssh_config" "$zshrc" "$config_lock"; do
   safe_regular_or_absent "$managed_path" || die 69 "unsafe managed path: $managed_path"
 done
-if [[ "$install_format" == "2" || "$install_format" == "3" ]]; then
+if [[ "$install_format" == "2" || "$install_format" == "3" || "$install_format" == "4" ]]; then
   for managed_path in "$config_helper" "$uninstall_helper"; do
     safe_regular_or_absent "$managed_path" || die 69 "unsafe managed helper: $managed_path"
-    [[ ! -f "$managed_path" || "$(/usr/bin/stat -f %Lp "$managed_path")" == "700" ]] || die 69 "managed helper has unsafe mode: $managed_path"
+    if [[ -f "$managed_path" ]]; then
+      stat_mode "$managed_path" || die 69 "cannot inspect managed helper mode: $managed_path"
+      [[ "$REPLY" == "700" ]] || die 69 "managed helper has unsafe mode: $managed_path"
+    fi
   done
 fi
-if [[ "$install_format" == "3" ]]; then
+if [[ "$install_format" == "3" || "$install_format" == "4" ]]; then
   for managed_path in "$login_helper" "$login_requirements"; do
     safe_regular_or_absent "$managed_path" || die 69 "unsafe managed login file: $managed_path"
   done
@@ -288,11 +370,11 @@ run_preflight() {
   preflight_file shvpn "$shvpn"
   preflight_file shanghaitech-ssh-route "$route"
   preflight_file targets "$targets_file"
-  if [[ "$install_format" == "2" || "$install_format" == "3" ]]; then
+  if [[ "$install_format" == "2" || "$install_format" == "3" || "$install_format" == "4" ]]; then
     preflight_file config-helper "$config_helper"
     preflight_file uninstall-helper "$uninstall_helper"
   fi
-  if [[ "$install_format" == "3" ]]; then
+  if [[ "$install_format" == "3" || "$install_format" == "4" ]]; then
     preflight_file login-helper "$login_helper"
     preflight_file login-requirements "$login_requirements"
     if (( preflight_failed != 0 )); then
@@ -366,7 +448,7 @@ esac
 
 archive_root="$lib_dir/uninstall-archives"
 if [[ -e "$archive_root" || -L "$archive_root" ]]; then
-  [[ -d "$archive_root" && ! -L "$archive_root" && "$(/usr/bin/stat -f %u "$archive_root")" == "$current_uid" ]] || die 69 "unsafe uninstall archive directory"
+  safe_owned_dir "$archive_root" || die 69 "unsafe uninstall archive directory"
 else
   /usr/bin/install -d -m 700 "$archive_root"
 fi

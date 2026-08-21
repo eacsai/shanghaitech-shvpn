@@ -15,19 +15,19 @@
 
 `shvpn` 只信任同时满足当前 UID、固定绝对可执行文件、固定完整 argv 和唯一回环监听者的 VPN 进程。停止时只向已验证进程发送 `SIGINT`，不会升级为 `SIGKILL`。不可信或含糊状态拒绝操作。
 
-生命周期、安装/迁移、动态目标更新和卸载共享当前用户拥有的 0600 非阻塞配置锁；生命周期在配置锁内再取得操作锁。冲突返回 `75`，锁描述符 close-on-exec，VPN 子进程不会继承。`add/remove/uninstall` helper 必须通过所有者、可执行位和格式 3 清单哈希验证；分派器不会跨 helper 调用持锁。
+生命周期、安装/迁移、动态目标更新和卸载共享当前用户拥有的 0600 非阻塞配置锁；生命周期在配置锁内再取得操作锁。冲突返回 `75`，锁描述符 close-on-exec，VPN 子进程不会继承。`add/remove/uninstall` helper 必须通过所有者、可执行位、平台和格式 4 清单哈希验证；分派器不会跨 helper 调用持锁。
 
 `shvpn login` 使用独立 Chrome profile 和 CDP 请求阶段拦截自动捕获固定上科大 VPN 路径的 CAS callback；匹配请求会先中止，再进行严格 URL/ticket 校验，并且不会打印 client 原始输出或 callback。代理、Playwright 调试和 TLS key-log 环境变量会从登录子进程移除。短信验证码仅从 `/dev/tty` 关闭回显读取，不写文件。登录结束只向本次前台 client 进程组发送 `SIGINT`，不会升级为 `SIGKILL`。
 
 Python 解释器版本、解析后可执行文件哈希，登录 helper、锁定依赖文件和完整包目录的确定性摘要都记录在清单中；变化时 `login/doctor/uninstall` fail closed。安装使用 `pip --require-hashes --only-binary=:all:`，不会运行 `playwright install`。专用 profile 会保留上海科技大学 CAS SSO、清除 VPN 域 cookie 和浏览缓存；清理失败时只丢弃精确验证过的 profile 目录。
 
-SSH helper 只接受 0600 allowlist 中的最终 `HostName` 和有效端口 `1`–`65535`。VPN 停止时直连，可信运行时走 SOCKS，不可信时拒绝。路由检查与连接不是原子操作，因此同一 macOS 用户下的恶意进程理论上可能在检查后抢占端口；本项目不把同 UID 恶意进程视作可完全隔离的边界。
+SSH helper 只接受 0600 allowlist 中的最终 `HostName` 和有效端口 `1`–`65535`。VPN 停止时直连，可信运行时走 SOCKS，不可信时拒绝。路由检查与连接不是原子操作，因此同一用户下的恶意进程理论上可能在检查后抢占端口；本项目不把同 UID 恶意进程视作可完全隔离的边界。
 
 `Match final host` 在 alias 应用 `HostName` 后匹配，且只接受与 allowlist **完全一致**的字符串，不通过 DNS 扩展信任。用户已有 alias 不被复制或改写。
 
 OpenSSH 多数值“先取得者生效”。安装器和 helper 会检查主配置及 `~/.ssh` 内安全、当前用户所有、非符号链接、深度/数量受限的 Include；发现已存在的 `ProxyCommand`/`ProxyJump` 冲突会在写入前失败。复杂、目录外或无法完整枚举的 Include 只警告，不伪称已完整检查。
 
-这些检查用 `-F ~/.ssh/config`，不涵盖 `/etc/ssh/ssh_config`。MDM 或系统级配置可能覆盖后置规则；应另用不带 `-F` 的 `/usr/bin/ssh -G ALIAS` 核对最终 `proxycommand`。
+这些检查用 `-F ~/.ssh/config`，不涵盖 `/etc/ssh/ssh_config`。MDM 或系统级配置可能覆盖后置规则；应另用不带 `-F` 的 `ssh -G ALIAS` 核对最终 `proxycommand`。
 
 `doctor` 只做本地解析，不建立远程连接。`reconnect` 仅在用户显式调用时，对已验证目标依次执行 `ssh -O check` 和 `ssh -O exit`；不删除 socket、不扫描或 kill SSH 进程，但可能中断终端、VS Code 或 Codex 会话。
 
@@ -35,7 +35,7 @@ OpenSSH 多数值“先取得者生效”。安装器和 helper 会检查主配�
 
 安装器拒绝符号链接、非当前用户文件、损坏标记和不匹配哈希。首次安装保存基线；安装、重装和 `add/remove` 写入前保存时间戳备份。动态更新只改 SSH 托管块、目标 allowlist 和清单，保留托管块外配置，并在普通错误时回滚。
 
-多文件更新无法抵抗任意时刻的断电或 `SIGKILL`。此类中断会 fail closed 并保留备份；使用仓库的 `./uninstall.zsh` 退役/恢复受信安装后再重装。格式 1/2→3 迁移若出现未被旧清单记录的 helper 或登录运行时，安装器同样拒绝继续，独立卸载器仍可恢复。
+多文件更新无法抵抗任意时刻的断电或 `SIGKILL`。此类中断会 fail closed 并保留备份；使用仓库的 `./uninstall.zsh` 退役/恢复受信安装后再重装。旧格式 1–3 仅允许在 Apple Silicon macOS 原地迁移到格式 4；Linux 拒绝无法证明平台归属的旧清单。
 
 `shvpn uninstall` 在停止可信 VPN 后取得配置锁、重复完整预检和监听状态检查，再恢复基线。修改过的托管块或含糊状态会让它在写入前停止。无关 SOCKS 监听者只会收到警告，绝不会被停止。卸载保留 `client-data.json`、日志和恢复归档。
 

@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 
 set -u
 setopt extendedglob
@@ -6,6 +6,9 @@ umask 077
 
 typeset -gr shvpn=@@SHVPN_Q@@
 typeset -gr targets_file=@@TARGETS_Q@@
+typeset -gr platform_id=@@PLATFORM_ID_Q@@
+typeset -gr stat_bin=@@STAT_BIN_Q@@
+typeset -gr nc_bin=@@NC_BIN_Q@@
 typeset -gr socks_host="127.0.0.1"
 typeset -gr socks_port="11080"
 typeset -gr current_uid="$(/usr/bin/id -u)"
@@ -14,6 +17,24 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 
 say_error() {
   print -u2 -r -- "$*"
+}
+
+stat_uid() {
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$stat_bin" -f %u -- "$1" 2>/dev/null)" || return 1
+  else
+    REPLY="$("$stat_bin" -c %u -- "$1" 2>/dev/null)" || return 1
+  fi
+  [[ "$REPLY" == <-> ]]
+}
+
+stat_mode() {
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$stat_bin" -f %Lp -- "$1" 2>/dev/null)" || return 1
+  else
+    REPLY="$("$stat_bin" -c %a -- "$1" 2>/dev/null)" || return 1
+  fi
+  [[ "$REPLY" == <-> ]]
 }
 
 if (( $# != 2 )); then
@@ -32,8 +53,10 @@ if [[ ! -f "$targets_file" || -L "$targets_file" ]]; then
   say_error "ShanghaiTech SSH route: target allowlist is missing or unsafe"
   exit 255
 fi
-owner="$(/usr/bin/stat -f %u "$targets_file" 2>/dev/null)" || exit 255
-mode="$(/usr/bin/stat -f %Lp "$targets_file" 2>/dev/null)" || exit 255
+stat_uid "$targets_file" || exit 255
+owner="$REPLY"
+stat_mode "$targets_file" || exit 255
+mode="$REPLY"
 if [[ "$owner" != "$current_uid" || "$mode" != "600" ]]; then
   say_error "ShanghaiTech SSH route: target allowlist ownership or mode is unsafe"
   exit 255
@@ -66,10 +89,10 @@ fi
 vpn_status=$?
 case "$vpn_status" in
   0)
-    exec /usr/bin/nc -x "$socks_host:$socks_port" -X 5 "$host" "$port"
+    exec "$nc_bin" -x "$socks_host:$socks_port" -X 5 "$host" "$port"
     ;;
   1)
-    exec /usr/bin/nc "$host" "$port"
+    exec "$nc_bin" "$host" "$port"
     ;;
   *)
     say_error "ShanghaiTech SSH route: shvpn state is unsafe or cannot be verified"

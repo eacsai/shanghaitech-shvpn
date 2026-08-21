@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 
 set -u
 setopt extendedglob
@@ -19,8 +19,18 @@ typeset -gr config_lock_file=@@CONFIG_LOCK_Q@@
 typeset -gr login_helper=@@LOGIN_HELPER_Q@@
 typeset -gr login_requirements=@@LOGIN_REQUIREMENTS_Q@@
 typeset -gr login_packages=@@LOGIN_PACKAGES_Q@@
+typeset -gr platform_id=@@PLATFORM_ID_Q@@
+typeset -gr stat_bin=@@STAT_BIN_Q@@
+typeset -gr sha_bin=@@SHA_BIN_Q@@
+typeset -gr nc_bin=@@NC_BIN_Q@@
+typeset -gr lsof_bin=@@LSOF_BIN_Q@@
+typeset -gr ps_bin=@@PS_BIN_Q@@
+typeset -gr pgrep_bin=@@PGREP_BIN_Q@@
+typeset -gr zsh_bin=@@ZSH_BIN_Q@@
+typeset -gr nohup_bin=@@NOHUP_BIN_Q@@
+typeset -gr chrome_bin=@@CHROME_BIN_Q@@
 typeset -gr ssh_root="${ssh_config:h}"
-typeset -gr ssh_client="/usr/bin/ssh"
+typeset -gr ssh_client=@@SSH_BIN_Q@@
 typeset -gr client_data="$state_dir/client-data.json"
 typeset -gr log_file="$state_dir/shvpn.log"
 typeset -gr lock_file="$state_dir/shvpn.operation.lock"
@@ -28,7 +38,7 @@ typeset -gr bind_host="127.0.0.1"
 typeset -gr bind_port="11080"
 typeset -gr current_uid="$(/usr/bin/id -u)"
 typeset -gr expected_client_command="$client -protocol atrust -server vpn.shanghaitech.edu.cn -port 443 -login-domain Shanghaitech.edu.cn -auth-type auth/cas -client-data-file $client_data -socks-bind $bind_host:$bind_port -http-bind  -auto-detect-interface"
-typeset -gr expected_wrapper_command="/bin/zsh $launcher"
+typeset -gr expected_wrapper_command="$zsh_bin $launcher"
 typeset -g operation_lock_fd
 typeset -g config_lock_fd
 
@@ -36,6 +46,24 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 
 say_error() {
   print -u2 -r -- "$*"
+}
+
+stat_uid() {
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$stat_bin" -f %u -- "$1" 2>/dev/null)" || return 1
+  else
+    REPLY="$("$stat_bin" -c %u -- "$1" 2>/dev/null)" || return 1
+  fi
+  [[ "$REPLY" == <-> ]]
+}
+
+stat_mode() {
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$stat_bin" -f %Lp -- "$1" 2>/dev/null)" || return 1
+  else
+    REPLY="$("$stat_bin" -c %a -- "$1" 2>/dev/null)" || return 1
+  fi
+  [[ "$REPLY" == <-> ]]
 }
 
 usage() {
@@ -55,7 +83,8 @@ typeset -g resolved_proxy=""
 safe_owned_regular() {
   local file_path="$1"
   [[ -f "$file_path" && ! -L "$file_path" ]] || return 1
-  [[ "$(/usr/bin/stat -f %u "$file_path" 2>/dev/null)" == "$current_uid" ]]
+  stat_uid "$file_path" || return 1
+  [[ "$REPLY" == "$current_uid" ]]
 }
 
 safe_owned_executable() {
@@ -68,16 +97,39 @@ safe_login_python() {
   [[ -x "$python_bin" ]] || return 1
   resolved="${python_bin:A}"
   [[ -f "$resolved" && -x "$resolved" && ! -L "$resolved" ]] || return 1
-  owner="$(/usr/bin/stat -f %u "$resolved" 2>/dev/null)" || return 1
+  stat_uid "$resolved" || return 1
+  owner="$REPLY"
   [[ "$owner" == 0 || "$owner" == "$current_uid" ]] || return 1
-  mode="$(/usr/bin/stat -f %Lp "$resolved" 2>/dev/null)" || return 1
+  stat_mode "$resolved" || return 1
+  mode="$REPLY"
   [[ "$mode" == <-> ]] || return 1
   permission=$(( 8#$mode ))
   (( (permission & 8#022) == 0 ))
 }
 
+safe_chrome_executable() {
+  local chrome_path="$1"
+  local resolved mode owner permission
+  [[ -x "$chrome_path" ]] || return 1
+  resolved="${chrome_path:A}"
+  [[ -f "$resolved" && -x "$resolved" && ! -L "$resolved" ]] || return 1
+  stat_uid "$resolved" || return 1
+  owner="$REPLY"
+  [[ "$owner" == 0 || "$owner" == "$current_uid" ]] || return 1
+  stat_mode "$resolved" || return 1
+  mode="$REPLY"
+  [[ "$mode" == <-> ]] || return 1
+  permission=$(( 8#$mode ))
+  (( (permission & 8#002) == 0 ))
+}
+
 sha_file() {
-  REPLY="$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}')" || return 1
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$sha_bin" -a 256 -- "$1" | /usr/bin/awk '{print $1}')" || return 1
+  else
+    REPLY="$("$sha_bin" -- "$1" | /usr/bin/awk '{print $1}')" || return 1
+  fi
+  [[ "$REPLY" == [0-9a-f](#c64) ]]
 }
 
 manifest_get() {
@@ -96,21 +148,27 @@ verify_installed_helper() {
     say_error "shvpn: install manifest is missing or unsafe"
     return 69
   fi
-  mode="$(/usr/bin/stat -f %Lp "$manifest" 2>/dev/null)" || return 69
+  stat_mode "$manifest" || return 69
+  mode="$REPLY"
   if [[ "$mode" != "600" ]]; then
     say_error "shvpn: install manifest mode is unsafe"
     return 69
   fi
   manifest_get format || { say_error "shvpn: invalid install manifest"; return 65; }
-  if [[ "$REPLY" != "3" ]]; then
-    say_error "shvpn: this command requires install manifest format 3; reinstall shvpn"
+  if [[ "$REPLY" != "4" ]]; then
+    say_error "shvpn: this command requires install manifest format 4; reinstall shvpn"
     return 65
   fi
+  manifest_get platform || { say_error "shvpn: install manifest has no platform entry"; return 65; }
+  [[ "$REPLY" == "$platform_id" ]] || { say_error "shvpn: install manifest belongs to another platform"; return 65; }
+  manifest_get state-dir || { say_error "shvpn: install manifest has no state directory"; return 65; }
+  [[ "$REPLY" == "$state_dir" ]] || { say_error "shvpn: install manifest state directory does not match"; return 65; }
   if ! safe_owned_executable "$helper"; then
     say_error "shvpn: managed helper is missing or unsafe: $helper"
     return 69
   fi
-  mode="$(/usr/bin/stat -f %Lp "$helper" 2>/dev/null)" || return 69
+  stat_mode "$helper" || return 69
+  mode="$REPLY"
   if [[ "$mode" != "700" ]]; then
     say_error "shvpn: managed helper mode is unsafe: $helper"
     return 69
@@ -128,15 +186,20 @@ verify_installed_helper() {
 verify_login_runtime() {
   local key expected python_bin python_version python_sha actual_version actual_sha actual_tree mode
   safe_owned_regular "$manifest" || { say_error "shvpn: install manifest is missing or unsafe"; return 69; }
-  mode="$(/usr/bin/stat -f %Lp "$manifest" 2>/dev/null)" || return 69
+  stat_mode "$manifest" || return 69
+  mode="$REPLY"
   [[ "$mode" == "600" ]] || { say_error "shvpn: install manifest mode is unsafe"; return 69; }
   manifest_get format || return 65
-  [[ "$REPLY" == "3" ]] || { say_error "shvpn: automatic login requires reinstalling shvpn"; return 65; }
+  [[ "$REPLY" == "4" ]] || { say_error "shvpn: automatic login requires reinstalling shvpn"; return 65; }
+  manifest_get platform || return 65
+  [[ "$REPLY" == "$platform_id" ]] || { say_error "shvpn: install manifest belongs to another platform"; return 65; }
+  manifest_get state-dir || return 65
+  [[ "$REPLY" == "$state_dir" ]] || { say_error "shvpn: install manifest state directory does not match"; return 65; }
 
   for key in login-helper login-requirements; do
     case "$key" in
-      login-helper) safe_owned_regular "$login_helper" && [[ "$(/usr/bin/stat -f %Lp "$login_helper")" == "700" ]] || { say_error "shvpn: automatic login helper is missing or unsafe"; return 69; }; sha_file "$login_helper" ;;
-      login-requirements) safe_owned_regular "$login_requirements" && [[ "$(/usr/bin/stat -f %Lp "$login_requirements")" == "600" ]] || { say_error "shvpn: login dependency lock is missing or unsafe"; return 69; }; sha_file "$login_requirements" ;;
+      login-helper) safe_owned_regular "$login_helper" && stat_mode "$login_helper" && [[ "$REPLY" == "700" ]] || { say_error "shvpn: automatic login helper is missing or unsafe"; return 69; }; sha_file "$login_helper" ;;
+      login-requirements) safe_owned_regular "$login_requirements" && stat_mode "$login_requirements" && [[ "$REPLY" == "600" ]] || { say_error "shvpn: login dependency lock is missing or unsafe"; return 69; }; sha_file "$login_requirements" ;;
     esac || return 74
     actual_sha="$REPLY"
     manifest_get "$key" || return 65
@@ -154,7 +217,7 @@ verify_login_runtime() {
   [[ "$actual_version" == "$python_version" ]] || { say_error "shvpn: recorded Python version changed; reinstall shvpn"; return 69; }
   sha_file "${python_bin:A}" || return 74
   [[ "$REPLY" == "$python_sha" ]] || { say_error "shvpn: recorded Python executable changed; reinstall shvpn"; return 69; }
-  [[ -d "$login_packages" && ! -L "$login_packages" && "$(/usr/bin/stat -f %u "$login_packages" 2>/dev/null)" == "$current_uid" ]] || { say_error "shvpn: managed Python packages are missing or unsafe"; return 69; }
+  [[ -d "$login_packages" && ! -L "$login_packages" ]] && stat_uid "$login_packages" && [[ "$REPLY" == "$current_uid" ]] || { say_error "shvpn: managed Python packages are missing or unsafe"; return 69; }
   actual_tree="$("$python_bin" -I -B "$login_helper" --tree-digest "$login_packages" 2>/dev/null)" || { say_error "shvpn: managed Python package tree is unsafe"; return 69; }
   manifest_get login-packages || return 65
   [[ "$actual_tree" == "$REPLY" ]] || { say_error "shvpn: managed Python package tree was modified; refusing"; return 2; }
@@ -176,8 +239,10 @@ load_targets() {
     say_error "shvpn: target allowlist is missing or unsafe"
     return 2
   fi
-  owner="$(/usr/bin/stat -f %u "$targets_file" 2>/dev/null)" || return 2
-  mode="$(/usr/bin/stat -f %Lp "$targets_file" 2>/dev/null)" || return 2
+  stat_uid "$targets_file" || return 2
+  owner="$REPLY"
+  stat_mode "$targets_file" || return 2
+  mode="$REPLY"
   if [[ "$owner" != "$current_uid" || "$mode" != "600" ]]; then
     say_error "shvpn: target allowlist ownership or mode is unsafe"
     return 2
@@ -331,7 +396,8 @@ prepare_ssh_diagnostics() {
     say_error "shvpn: SSH config is missing or unsafe"
     return 2
   fi
-  mode="$(/usr/bin/stat -f %Lp "$ssh_config" 2>/dev/null)" || return 2
+  stat_mode "$ssh_config" || return 2
+  mode="$REPLY"
   [[ "$mode" == <-> ]] || return 2
   permission=$(( 8#$mode ))
   if (( (permission & 8#022) != 0 )); then
@@ -383,10 +449,17 @@ check_vscode_and_codex() {
     print -r -- "doctor: VS Code Remote-SSH extension not detected (optional)."
   fi
 
-  settings_files=(
-    "$HOME/Library/Application Support/Code/User/settings.json"
-    "$HOME/Library/Application Support/Code - Insiders/User/settings.json"
-  )
+  if [[ "$platform_id" == darwin-* ]]; then
+    settings_files=(
+      "$HOME/Library/Application Support/Code/User/settings.json"
+      "$HOME/Library/Application Support/Code - Insiders/User/settings.json"
+    )
+  else
+    settings_files=(
+      "$HOME/.config/Code/User/settings.json"
+      "$HOME/.config/Code - Insiders/User/settings.json"
+    )
+  fi
   for settings_file in "${settings_files[@]}"; do
     [[ -e "$settings_file" || -L "$settings_file" ]] || continue
     if ! safe_owned_regular "$settings_file"; then
@@ -425,7 +498,7 @@ doctor_shvpn() {
   else
     doctor_failures=$(( doctor_failures + 1 ))
   fi
-  if [[ -d "/Applications/Google Chrome.app" ]]; then
+  if safe_chrome_executable "$chrome_bin"; then
     print -r -- "doctor: Google Chrome detected."
   else
     say_error "doctor: warning: Google Chrome is not installed; 'shvpn login' needs Chrome"
@@ -560,10 +633,10 @@ get_listener_pid() {
   local -a pids
   pids=()
 
-  output="$(/usr/sbin/lsof -nP -a -iTCP@${bind_host}:${bind_port} -sTCP:LISTEN -Fpu 2>/dev/null)"
+  output="$("$lsof_bin" -nP -a -iTCP@${bind_host}:${bind_port} -sTCP:LISTEN -Fpu 2>/dev/null)"
   rc=$?
   if (( rc != 0 )); then
-    if /usr/bin/nc -z "$bind_host" "$bind_port" >/dev/null 2>&1; then
+    if "$nc_bin" -z "$bind_host" "$bind_port" >/dev/null 2>&1; then
       return 2
     fi
     return 1
@@ -585,7 +658,7 @@ get_process_executable() {
   local pid="$1"
   local output line
 
-  output="$(/usr/sbin/lsof -nP -a -p "$pid" -d txt -Fn 2>/dev/null)" || return 1
+  output="$("$lsof_bin" -nP -a -p "$pid" -d txt -Fn 2>/dev/null)" || return 1
   for line in ${(f)output}; do
     if [[ "$line" == n* ]]; then
       REPLY="${line#n}"
@@ -600,7 +673,7 @@ get_process_uid() {
   local pid="$1"
   local uid
 
-  uid="$(/bin/ps -p "$pid" -o uid= 2>/dev/null)" || return 1
+  uid="$("$ps_bin" -p "$pid" -o uid= 2>/dev/null)" || return 1
   uid="${uid//[[:space:]]/}"
   [[ "$uid" == <-> ]] || return 1
   REPLY="$uid"
@@ -612,7 +685,7 @@ get_process_command() {
   local pid="$1"
   local command_line
 
-  command_line="$(/bin/ps -ww -p "$pid" -o command= 2>/dev/null)" || return 1
+  command_line="$("$ps_bin" -ww -p "$pid" -o command= 2>/dev/null)" || return 1
   [[ -n "$command_line" ]] || return 1
   REPLY="$command_line"
   return 0
@@ -645,7 +718,7 @@ trusted_wrapper_pid() {
   [[ "$uid" == "$current_uid" ]] || return 1
   get_process_executable "$pid" || return 1
   executable="$REPLY"
-  [[ "$executable" == "/bin/zsh" ]] || return 1
+  [[ "$executable" == "$zsh_bin" ]] || return 1
   get_process_command "$pid" || return 1
   command_line="$REPLY"
   [[ "$command_line" == "$expected_wrapper_command" ]] || return 1
@@ -753,7 +826,7 @@ cleanup_started_job() {
     wrapper_owned=1
   fi
 
-  children_text="$(/usr/bin/pgrep -P "$wrapper_pid" 2>/dev/null)"
+  children_text="$("$pgrep_bin" -P "$wrapper_pid" 2>/dev/null)"
   for child_pid in ${(f)children_text}; do
     if trusted_client_pid "$child_pid"; then
       owned_children+=("$child_pid")
@@ -839,7 +912,7 @@ start_vpn() {
   fi
 
   print -r -- "=== shvpn start $(/bin/date -u +%Y-%m-%dT%H:%M:%SZ) command-pid=$$ ===" >>"$log_file"
-  /usr/bin/nohup "$launcher" </dev/null >>"$log_file" 2>&1 &
+  "$nohup_bin" "$launcher" </dev/null >>"$log_file" 2>&1 &
   wrapper_pid=$!
 
   for (( i = 0; i < 80; i++ )); do
@@ -978,12 +1051,18 @@ login_vpn() {
     return 2
   fi
 
+  if [[ "$platform_id" == linux-* && -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    say_error "shvpn: Linux CAS login needs a graphical desktop session (DISPLAY or WAYLAND_DISPLAY is unset)"
+    return 69
+  fi
+
   verify_login_runtime || return $?
   python_bin="$REPLY"
   print -r -- "shvpn: opening the dedicated ShanghaiTech CAS login window..."
   "$python_bin" -I -B "$login_helper" \
     --package-dir "$login_packages" \
     --launcher "$launcher" \
+    --chrome-executable "$chrome_bin" \
     --state-dir "$state_dir" || return $?
   start_vpn
   return $?

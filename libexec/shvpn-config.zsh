@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 
 set -eu
 setopt extendedglob
@@ -12,6 +12,10 @@ typeset -gr manifest=@@MANIFEST_Q@@
 typeset -gr self=@@CONFIG_HELPER_Q@@
 typeset -gr config_lock=@@CONFIG_LOCK_Q@@
 typeset -gr backup_root=@@BACKUP_ROOT_Q@@
+typeset -gr platform_id=@@PLATFORM_ID_Q@@
+typeset -gr stat_bin=@@STAT_BIN_Q@@
+typeset -gr sha_bin=@@SHA_BIN_Q@@
+typeset -gr ssh_bin=@@SSH_BIN_Q@@
 typeset -gr ssh_root="${ssh_config:h}"
 typeset -gr begin_ssh="# >>> shanghaitech-shvpn managed SSH targets >>>"
 typeset -gr end_ssh="# <<< shanghaitech-shvpn managed SSH targets <<<"
@@ -27,6 +31,24 @@ say_error() {
   print -u2 -r -- "$*"
 }
 
+stat_uid() {
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$stat_bin" -f %u -- "$1" 2>/dev/null)" || return 1
+  else
+    REPLY="$("$stat_bin" -c %u -- "$1" 2>/dev/null)" || return 1
+  fi
+  [[ "$REPLY" == <-> ]]
+}
+
+stat_mode() {
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$stat_bin" -f %Lp -- "$1" 2>/dev/null)" || return 1
+  else
+    REPLY="$("$stat_bin" -c %a -- "$1" 2>/dev/null)" || return 1
+  fi
+  [[ "$REPLY" == <-> ]]
+}
+
 die() {
   say_error "shvpn $action: $2"
   exit "$1"
@@ -40,17 +62,24 @@ usage() {
 safe_owned_regular() {
   local file_path="$1"
   [[ -f "$file_path" && ! -L "$file_path" ]] || return 1
-  [[ "$(/usr/bin/stat -f %u "$file_path" 2>/dev/null)" == "$current_uid" ]]
+  stat_uid "$file_path" || return 1
+  [[ "$REPLY" == "$current_uid" ]]
 }
 
 safe_owned_dir() {
   local dir_path="$1"
   [[ -d "$dir_path" && ! -L "$dir_path" ]] || return 1
-  [[ "$(/usr/bin/stat -f %u "$dir_path" 2>/dev/null)" == "$current_uid" ]]
+  stat_uid "$dir_path" || return 1
+  [[ "$REPLY" == "$current_uid" ]]
 }
 
 sha_file() {
-  REPLY="$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}')" || return 1
+  if [[ "$platform_id" == darwin-* ]]; then
+    REPLY="$("$sha_bin" -a 256 -- "$1" | /usr/bin/awk '{print $1}')" || return 1
+  else
+    REPLY="$("$sha_bin" -- "$1" | /usr/bin/awk '{print $1}')" || return 1
+  fi
+  [[ "$REPLY" == [0-9a-f](#c64) ]]
 }
 
 manifest_get() {
@@ -140,7 +169,8 @@ load_targets() {
   target_hosts=()
   target_set=()
   safe_owned_regular "$targets_file" || die 69 "target allowlist is missing or unsafe"
-  mode="$(/usr/bin/stat -f %Lp "$targets_file")" || die 74 "cannot inspect target allowlist"
+  stat_mode "$targets_file" || die 74 "cannot inspect target allowlist"
+  mode="$REPLY"
   [[ "$mode" == "600" ]] || die 69 "target allowlist mode is unsafe"
   while IFS= read -r line || [[ -n "$line" ]]; do
     validate_target "$line" || die 65 "target allowlist is malformed"
@@ -156,7 +186,7 @@ resolve_name() {
   local output
   resolved_host=""
   resolved_proxy=""
-  output="$(/usr/bin/ssh -F "$ssh_config" -G -- "$name" 2>/dev/null)" || return 1
+  output="$("$ssh_bin" -F "$ssh_config" -G -- "$name" 2>/dev/null)" || return 1
   resolved_host="$(print -r -- "$output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')"
   resolved_proxy="$(print -r -- "$output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')"
   [[ -n "$resolved_host" ]]
@@ -265,22 +295,28 @@ collect_literal_ssh_names() {
 verify_manifest_and_state() {
   local key expected mode begin_count end_count
   safe_owned_regular "$manifest" || die 69 "install manifest is missing or unsafe"
-  mode="$(/usr/bin/stat -f %Lp "$manifest")" || die 74 "cannot inspect install manifest"
+  stat_mode "$manifest" || die 74 "cannot inspect install manifest"
+  mode="$REPLY"
   [[ "$mode" == "600" ]] || die 69 "install manifest mode is unsafe"
   manifest_get format || die 65 "invalid install manifest"
-  [[ "$REPLY" == "3" ]] || die 65 "dynamic target management requires install manifest format 3; reinstall shvpn"
+  [[ "$REPLY" == "4" ]] || die 65 "dynamic target management requires install manifest format 4; reinstall shvpn"
+  manifest_get platform || die 65 "install manifest is missing platform"
+  [[ "$REPLY" == "$platform_id" ]] || die 65 "install manifest belongs to another platform"
+  manifest_get state-dir || die 65 "install manifest is missing state directory"
+  [[ "$REPLY" == "${config_lock:h}" ]] || die 65 "install manifest state directory does not match"
   for key in config-helper shanghaitech-ssh-route targets; do
     manifest_get "$key" || die 65 "missing install manifest entry: $key"
     expected="$REPLY"
     case "$key" in
-      config-helper) safe_owned_regular "$self" && [[ -x "$self" && "$(/usr/bin/stat -f %Lp "$self" 2>/dev/null)" == "700" ]] || die 69 "configuration helper is missing or unsafe"; sha_file "$self" ;;
-      shanghaitech-ssh-route) safe_owned_regular "$route" && [[ -x "$route" && "$(/usr/bin/stat -f %Lp "$route" 2>/dev/null)" == "755" ]] || die 69 "route helper is missing or unsafe"; sha_file "$route" ;;
+      config-helper) safe_owned_regular "$self" && [[ -x "$self" ]] || die 69 "configuration helper is missing or unsafe"; stat_mode "$self" && [[ "$REPLY" == "700" ]] || die 69 "configuration helper mode is unsafe"; sha_file "$self" ;;
+      shanghaitech-ssh-route) safe_owned_regular "$route" && [[ -x "$route" ]] || die 69 "route helper is missing or unsafe"; stat_mode "$route" && [[ "$REPLY" == "755" ]] || die 69 "route helper mode is unsafe"; sha_file "$route" ;;
       targets) safe_owned_regular "$targets_file" || die 69 "target allowlist is missing or unsafe"; sha_file "$targets_file" ;;
     esac || die 74 "cannot hash managed $key"
     [[ "$REPLY" == "$expected" ]] || die 2 "managed $key was modified; refusing"
   done
   safe_owned_regular "$ssh_config" || die 69 "SSH config is missing or unsafe"
-  mode="$(/usr/bin/stat -f %Lp "$ssh_config")" || die 74 "cannot inspect SSH config"
+  stat_mode "$ssh_config" || die 74 "cannot inspect SSH config"
+  mode="$REPLY"
   [[ "$mode" == <-> ]] || die 69 "SSH config mode is invalid"
   (( (8#$mode & 8#022) == 0 )) || die 69 "SSH config is writable by group or others"
   marker_count "$ssh_config" "$begin_ssh" || die 65 "cannot inspect SSH markers"
@@ -299,9 +335,9 @@ verify_manifest_and_state() {
 validate_candidate() {
   local name output host proxy
   local -A seen_names
-  [[ -x /usr/bin/ssh && -f /usr/bin/ssh ]] || die 69 "system OpenSSH client is unavailable"
+  [[ -x "$ssh_bin" && -f "$ssh_bin" ]] || die 69 "system OpenSSH client is unavailable"
   for name in "${target_hosts[@]}"; do
-    output="$(/usr/bin/ssh -F "$work_dir/ssh.config" -G -- "$name" 2>/dev/null)" || die 2 "ssh -G rejected target $name"
+    output="$("$ssh_bin" -F "$work_dir/ssh.config" -G -- "$name" 2>/dev/null)" || die 2 "ssh -G rejected target $name"
     host="$(print -r -- "$output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')"
     proxy="$(print -r -- "$output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')"
     [[ "$host" == "$name" && "$proxy" == "$expected_route_proxy" ]] || die 2 "SSH target $name resolves outside the managed configuration"
@@ -310,7 +346,7 @@ validate_candidate() {
   for name in "${discovered_ssh_names[@]}"; do
     [[ -z "${seen_names[$name]:-}" ]] || continue
     seen_names[$name]=1
-    output="$(/usr/bin/ssh -F "$work_dir/ssh.config" -G -- "$name" 2>/dev/null)" || die 2 "ssh -G rejected discovered alias $name"
+    output="$("$ssh_bin" -F "$work_dir/ssh.config" -G -- "$name" 2>/dev/null)" || die 2 "ssh -G rejected discovered alias $name"
     host="$(print -r -- "$output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')"
     if [[ -n "${target_set[$host]:-}" ]]; then
       proxy="$(print -r -- "$output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')"

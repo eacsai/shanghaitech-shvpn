@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 
 set -eu
 umask 077
@@ -11,6 +11,7 @@ typeset -gr go_sum_sha="8af52b375ebe736a54883a39bdffff6cdfb8f55face981cbbd13e336
 typeset -gr required_go="go1.25.6"
 typeset -gr project_root="${0:A:h:h}"
 typeset -gr patch_file="$project_root/patches/zju-connect-v1.2.2-node-selection.patch"
+typeset -gr platform_helper="$project_root/libexec/platform.zsh"
 
 say_error() {
   print -u2 -r -- "$*"
@@ -22,21 +23,35 @@ if (( $# != 1 )); then
 fi
 
 output="${1:A}"
-if [[ "$(/usr/bin/uname -s)" != "Darwin" || "$(/usr/bin/uname -m)" != "arm64" ]]; then
-  say_error "build-client: version 1 supports Apple Silicon macOS (Darwin/arm64) only"
+[[ -f "$platform_helper" && ! -L "$platform_helper" ]] || {
+  say_error "build-client: platform helper is missing or unsafe"
   exit 69
-fi
+}
+source "$platform_helper"
+shvpn_detect_platform || {
+  say_error "build-client: supported platforms are Darwin/arm64, Linux/amd64, and Linux/arm64"
+  exit 69
+}
 
-for command_name in git go shasum mktemp; do
-  command -v "$command_name" >/dev/null 2>&1 || {
+for command_name in git go mktemp; do
+  shvpn_resolve_command "$command_name" || {
     say_error "build-client: required command not found: $command_name"
     exit 69
   }
+  typeset -g "${command_name}_bin=$REPLY"
 done
+codesign_bin=""
+if [[ "$shvpn_os" == "Darwin" ]]; then
+  shvpn_resolve_command codesign || {
+    say_error "build-client: required command not found: codesign"
+    exit 69
+  }
+  codesign_bin="$REPLY"
+fi
 
-go_version="$(go version)"
-if [[ "$go_version" != "go version ${required_go} darwin/arm64" ]]; then
-  say_error "build-client: Go ${required_go} for darwin/arm64 is required; found: $go_version"
+go_version="$($go_bin version)"
+if [[ "$go_version" != "go version ${required_go} ${shvpn_goos}/${shvpn_goarch}" ]]; then
+  say_error "build-client: Go ${required_go} for ${shvpn_goos}/${shvpn_goarch} is required; found: $go_version"
   exit 69
 fi
 
@@ -50,7 +65,7 @@ temp_parent="${TMPDIR:-/tmp}"
   say_error "build-client: TMPDIR must name an existing absolute directory"
   exit 69
 }
-build_tmp="$(mktemp -d "$temp_parent/shvpn-build.XXXXXX")"
+build_tmp="$($mktemp_bin -d "$temp_parent/shvpn-build.XXXXXX")"
 cleanup() {
   if [[ -n "${build_tmp:-}" && -d "$build_tmp" && "$build_tmp" == "$temp_parent"/shvpn-build.* ]]; then
     /bin/rm -rf -- "$build_tmp"
@@ -59,42 +74,55 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 source_dir="$build_tmp/source"
-git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$upstream_tag" \
+"$git_bin" -c advice.detachedHead=false clone --quiet --depth 1 --branch "$upstream_tag" \
   "$upstream_url" "$source_dir"
 
-actual_commit="$(git -C "$source_dir" rev-parse HEAD)"
+actual_commit="$("$git_bin" -C "$source_dir" rev-parse HEAD)"
 [[ "$actual_commit" == "$upstream_commit" ]] || {
   say_error "build-client: upstream tag resolved to unexpected commit: $actual_commit"
   exit 65
 }
 
-actual_mod_sha="$(shasum -a 256 "$source_dir/go.mod" | /usr/bin/awk '{print $1}')"
-actual_sum_sha="$(shasum -a 256 "$source_dir/go.sum" | /usr/bin/awk '{print $1}')"
+shvpn_sha_file "$source_dir/go.mod" || exit 74
+actual_mod_sha="$REPLY"
+shvpn_sha_file "$source_dir/go.sum" || exit 74
+actual_sum_sha="$REPLY"
 [[ "$actual_mod_sha" == "$go_mod_sha" && "$actual_sum_sha" == "$go_sum_sha" ]] || {
   say_error "build-client: upstream module metadata hash mismatch"
   exit 65
 }
 
-git -C "$source_dir" apply --unidiff-zero --check "$patch_file"
-git -C "$source_dir" apply --unidiff-zero "$patch_file"
+"$git_bin" -C "$source_dir" apply --unidiff-zero --check "$patch_file"
+"$git_bin" -C "$source_dir" apply --unidiff-zero "$patch_file"
 
 (
   cd "$source_dir"
-  GOTOOLCHAIN=local GOFLAGS=-mod=readonly go test ./client/atrust -count=1
-  GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 GOFLAGS=-mod=readonly MACOSX_DEPLOYMENT_TARGET=12.0 \
-    go build -trimpath \
-      -ldflags='-s -w -buildid= -X main.zjuConnectVersion=v1.2.2-shanghaitech-nodefix1' \
-      -o "$build_tmp/zju-connect" .
+  GOTOOLCHAIN=local GOFLAGS=-mod=readonly "$go_bin" test ./client/atrust -count=1
+  if [[ "$shvpn_os" == "Darwin" ]]; then
+    GOTOOLCHAIN=local CGO_ENABLED=0 GOOS="$shvpn_goos" GOARCH="$shvpn_goarch" GOFLAGS=-mod=readonly MACOSX_DEPLOYMENT_TARGET=12.0 \
+      "$go_bin" build -trimpath \
+        -ldflags='-s -w -buildid= -X main.zjuConnectVersion=v1.2.2-shanghaitech-nodefix1' \
+        -o "$build_tmp/zju-connect" .
+  else
+    GOTOOLCHAIN=local CGO_ENABLED=0 GOOS="$shvpn_goos" GOARCH="$shvpn_goarch" GOFLAGS=-mod=readonly \
+      "$go_bin" build -trimpath \
+        -ldflags='-s -w -buildid= -X main.zjuConnectVersion=v1.2.2-shanghaitech-nodefix1' \
+        -o "$build_tmp/zju-connect" .
+  fi
 )
 
-post_mod_sha="$(shasum -a 256 "$source_dir/go.mod" | /usr/bin/awk '{print $1}')"
-post_sum_sha="$(shasum -a 256 "$source_dir/go.sum" | /usr/bin/awk '{print $1}')"
+shvpn_sha_file "$source_dir/go.mod" || exit 74
+post_mod_sha="$REPLY"
+shvpn_sha_file "$source_dir/go.sum" || exit 74
+post_sum_sha="$REPLY"
 [[ "$post_mod_sha" == "$go_mod_sha" && "$post_sum_sha" == "$go_sum_sha" ]] || {
   say_error "build-client: module metadata changed during test/build"
   exit 65
 }
 
-/usr/bin/codesign --verify --strict "$build_tmp/zju-connect"
+if [[ -n "$codesign_bin" ]]; then
+  "$codesign_bin" --verify --strict "$build_tmp/zju-connect"
+fi
 [[ "$("$build_tmp/zju-connect" -version)" == "ZJU Connect v1.2.2-shanghaitech-nodefix1" ]] || {
   say_error "build-client: built client failed its version smoke test"
   exit 65
@@ -108,5 +136,7 @@ if [[ -e "$output" || -L "$output" ]]; then
 fi
 /bin/cp "$build_tmp/zju-connect" "$output"
 /bin/chmod 755 "$output"
-/usr/bin/codesign --verify --strict "$output"
+if [[ -n "$codesign_bin" ]]; then
+  "$codesign_bin" --verify --strict "$output"
+fi
 print -r -- "Built verified zju-connect at $output"

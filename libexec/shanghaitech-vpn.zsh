@@ -1,9 +1,10 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 set -u
 umask 077
 
 client=@@CLIENT_Q@@
 state_dir=@@STATE_DIR_Q@@
+nc_bin=@@NC_BIN_Q@@
 client_data="$state_dir/client-data.json"
 
 # Keep this VPN path independent from any Clash/proxy environment inherited by
@@ -24,7 +25,7 @@ fi
 
 /usr/bin/install -d -m 700 "$state_dir"
 
-if /usr/bin/nc -z -w 1 127.0.0.1 11080 >/dev/null 2>&1; then
+if "$nc_bin" -z -w 1 127.0.0.1 11080 >/dev/null 2>&1; then
   print -u2 "127.0.0.1:11080 is already in use; not starting another VPN client."
   exit 1
 fi

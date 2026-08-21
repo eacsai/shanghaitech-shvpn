@@ -1,6 +1,6 @@
 # ShanghaiTech shvpn
 
-在 Apple Silicon Mac 上用 `shvpn` 连接上海科技大学 VPN，并且只让指定的 SSH 服务器经过 VPN。Clash Verge、浏览器、系统代理和其他网络流量不受影响。
+在 Apple Silicon Mac 或 Linux 桌面上用 `shvpn` 连接上海科技大学 VPN，并且只让指定的 SSH 服务器经过 VPN。Clash、浏览器、系统代理和其他网络流量不受影响。
 
 > 非官方社区项目，与上海科技大学、深信服或 zju-connect 上游无隶属或背书关系。官方支持方式见[上科大信息化办公室 VPN 说明](https://it.shanghaitech.edu.cn/2021/0424/c8423a63191/page.htm)。
 
@@ -10,11 +10,23 @@
 - VPN 开启时，只有 allowlist 中 SSH 目标经 `127.0.0.1:11080`；VPN 停止时同一命令直接连接，适合校内网。
 - 终端、VS Code Remote-SSH 和调用系统 OpenSSH 的 Codex 共用 `~/.ssh/config`，无需切换配置。
 - 已有 SSH alias、`User`、`Port`、`IdentityFile` 和 ControlMaster 设置继续生效。
-- 不退出或修改 Clash Verge，不启用 TUN，不修改 macOS 系统代理。
+- 不退出或修改 Clash，不启用 TUN，不修改系统代理或系统路由。
 
 ## 要求与安装
 
-目前支持 macOS 12+、Apple Silicon（`Darwin/arm64`），需要 Git、zsh、OpenSSH、`codesign`、`nc`、**Go 1.25.6 darwin/arm64**、**Python 3.10–3.14（含 pip）**和 **Google Chrome**。安装不使用 `sudo`，也不代装这些依赖。
+| 平台 | 架构 | 额外要求 |
+|---|---|---|
+| macOS 12+ | Apple Silicon (`arm64`) | `codesign`、系统 `nc` |
+| Linux 桌面 | `amd64` / `arm64` | `lsof`、GNU `stat`/`sha256sum`、OpenBSD `nc` |
+
+两种平台都需要 Git、zsh 5.8+、OpenSSH、**与本机匹配的 Go 1.25.6**、**Python 3.10–3.14（含 pip）**和 **Google Chrome**。安装脚本不使用 `sudo`，也不代装依赖。Ubuntu/Debian 可先安装：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git zsh openssh-client lsof netcat-openbsd python3 python3-pip ca-certificates
+```
+
+Chrome 与 Go 1.25.6 请使用各自官方发行包。Linux 必须从有 `DISPLAY` 或 `WAYLAND_DISPLAY` 的图形桌面终端运行 `shvpn login`；纯 SSH 无桌面会话不能完成首次 CAS 登录。完整说明见 [LINUX_SETUP.md](LINUX_SETUP.md)。
 
 ```zsh
 uname -m
@@ -35,7 +47,7 @@ cd shanghaitech-shvpn
   --add-path
 ```
 
-不想修改 `~/.zshrc` 时把 `--add-path` 换成 `--no-path`，并使用安装器输出的完整命令路径。
+`--add-path` 在 macOS 修改 `~/.zshrc`，在 Linux 修改 `~/.profile`。不想修改时换成 `--no-path`，并使用安装器输出的完整命令路径。
 
 ## 命令
 
@@ -86,7 +98,7 @@ Host gpu
 shvpn doctor gpu-01
 ```
 
-安装器、动态配置 helper、`doctor` 和 `reconnect` 用 `-F ~/.ssh/config` 验证用户配置，因此不会审计 `/etc/ssh/ssh_config`。普通 `ssh` 仍会读取系统配置；若 MDM 或系统级配置更早设置了 `ProxyCommand`/`ProxyJump`，请额外运行不带 `-F` 的 `/usr/bin/ssh -G ALIAS`，确认最终 `proxycommand` 指向 `shanghaitech-ssh-route`。
+安装器、动态配置 helper、`doctor` 和 `reconnect` 用 `-F ~/.ssh/config` 验证用户配置，因此不会审计 `/etc/ssh/ssh_config`。普通 `ssh` 仍会读取系统配置；若系统级配置更早设置了 `ProxyCommand`/`ProxyJump`，请额外运行不带 `-F` 的 `ssh -G ALIAS`，确认最终 `proxycommand` 指向 `shanghaitech-ssh-route`。
 
 ## 路径选择与重连
 
@@ -106,7 +118,7 @@ ssh gpu
 
 `shvpn` 会复用已保存的登录状态。首次使用、状态过期或学校要求重新验证时，运行 `shvpn login`，亲自在专用 Chrome 窗口完成 CAS；无需复制、查看或粘贴 callback URL。若学校要求短信验证，终端会关闭回显后读取验证码，本项目不会保存或自动填写验证码。
 
-自动登录使用锁定哈希的 Playwright 1.62.0 Python 包，但不会下载 Playwright 自带浏览器；只调用本机 Google Chrome。CAS 登录复用状态保存在 `~/Library/Application Support/ShanghaitechVPN/cas-chrome-profile/`，与日常 Chrome 配置隔离，且卸载时默认保留，避免每次重新登录。该目录可能含有效 SSO 状态，不要复制、同步或公开。
+自动登录使用锁定哈希的 Playwright 1.62.0 Python 包，但不会下载 Playwright 自带浏览器；只调用本机 Google Chrome。CAS 登录复用状态在 macOS 保存在 `~/Library/Application Support/ShanghaitechVPN/cas-chrome-profile/`，在 Linux 保存在 `${XDG_STATE_HOME:-~/.local/state}/shanghaitech-shvpn/cas-chrome-profile/`。它与日常 Chrome 配置隔离，卸载时默认保留。该目录可能含有效 SSO 状态，不要复制、同步或公开。
 
 安装、`add/remove`、VPN 生命周期和卸载使用同一非阻塞配置锁；并发操作返回 `75`。托管文件按哈希校验，所有配置写入前保存时间戳备份到 `~/.local/lib/shanghaitech-shvpn/backups/`。发现符号链接、所有者异常、哈希变化、SSH 冲突或标记歧义时会在写入前失败关闭（fail closed）。
 
@@ -124,4 +136,4 @@ ssh gpu
 
 ---
 
-**English summary:** An unofficial, source-built Apple-Silicon macOS helper for ShanghaiTech aTrust/CAS. It routes only explicitly managed SSH `HostName` values through the local VPN SOCKS listener and leaves Clash and other traffic unchanged.
+**English summary:** An unofficial, source-built macOS/Linux desktop helper for ShanghaiTech aTrust/CAS. It routes only explicitly managed SSH `HostName` values through the local VPN SOCKS listener and leaves Clash and other traffic unchanged.

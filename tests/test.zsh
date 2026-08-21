@@ -61,6 +61,7 @@ expected_paths=(
   .gitignore
   CODEX_SETUP.md
   LICENSE
+  LINUX_SETUP.md
   NOTICE.md
   README.md
   SECURITY.md
@@ -68,6 +69,7 @@ expected_paths=(
   install.zsh
   libexec/build-client.zsh
   libexec/build-login-runtime.zsh
+  libexec/platform.zsh
   libexec/python-login-helper.py
   libexec/shanghaitech-ssh-route.zsh
   libexec/shanghaitech-vpn.zsh
@@ -76,7 +78,9 @@ expected_paths=(
   patches/zju-connect-v1.2.2-node-selection.patch
   requirements-login.txt
   tests/test.zsh
+  tests/test_linux.zsh
   tests/test_login_helper.py
+  tests/test_platform.zsh
   uninstall.zsh
 )
 actual_paths=("${(@f)$({
@@ -84,9 +88,13 @@ actual_paths=("${(@f)$({
   for pending_path in \
     libexec/build-login-runtime.zsh \
     libexec/python-login-helper.py \
+    libexec/platform.zsh \
     libexec/shvpn-config.zsh \
     requirements-login.txt \
-    tests/test_login_helper.py; do
+    tests/test_linux.zsh \
+    tests/test_login_helper.py \
+    tests/test_platform.zsh \
+    LINUX_SETUP.md; do
     if [[ -f "$project_root/$pending_path" ]] && ! /usr/bin/git -C "$project_root" ls-files --error-unmatch "$pending_path" >/dev/null 2>&1; then
       print -r -- "$pending_path"
     fi
@@ -233,7 +241,7 @@ done
   print -r -- '    h = hashlib.sha256()'
   print -r -- '    for _, record in sorted(records): h.update(record)'
   print -r -- '    return h.hexdigest()'
-  print -r -- 'parser = argparse.ArgumentParser(); parser.add_argument("--tree-digest"); parser.add_argument("--package-dir"); parser.add_argument("--launcher"); parser.add_argument("--state-dir"); args = parser.parse_args()'
+  print -r -- 'parser = argparse.ArgumentParser(); parser.add_argument("--tree-digest"); parser.add_argument("--package-dir"); parser.add_argument("--launcher"); parser.add_argument("--chrome-executable"); parser.add_argument("--state-dir"); args = parser.parse_args()'
   print -r -- 'if args.tree_digest: print(digest(args.tree_digest)); raise SystemExit(0)'
   print -r -- 'pathlib.Path(args.state_dir).mkdir(parents=True, exist_ok=True)'
   print -r -- '(pathlib.Path(args.state_dir) / "client-data.json").write_text("{}")'
@@ -381,7 +389,8 @@ assert_file_mode 700 "$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh"
 assert_file_mode 700 "$fixture_home/.local/lib/shanghaitech-shvpn/python-login-helper.py"
 assert_file_mode 600 "$fixture_home/.local/lib/shanghaitech-shvpn/requirements-login.txt"
 [[ -d "$fixture_home/.local/lib/shanghaitech-shvpn/python-packages" && ! -L "$fixture_home/.local/lib/shanghaitech-shvpn/python-packages" ]] || fail "managed Python package tree is missing"
-/usr/bin/grep -Fx $'format\t3' "$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv" >/dev/null || fail "fresh install did not write manifest format 3"
+/usr/bin/grep -Fx $'format\t4' "$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv" >/dev/null || fail "fresh install did not write manifest format 4"
+/usr/bin/grep -Fx $'platform\tdarwin-arm64' "$fixture_home/.local/lib/shanghaitech-shvpn/install.manifest.tsv" >/dev/null || fail "fresh install did not record its platform"
 assert_count 1 "$begin_ssh" "$fixture_home/.ssh/config"
 assert_count 1 "$begin_path" "$fixture_home/.zshrc"
 
@@ -662,7 +671,10 @@ route_rc=$?
 set -e
 [[ "$route_rc" == 64 ]] || fail "route helper did not reject an unlisted target"
 
-HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor >"$test_tmp/doctor.out" 2>"$test_tmp/doctor.err" || fail "doctor did not pass on a healthy stopped fixture"
+HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor >"$test_tmp/doctor.out" 2>"$test_tmp/doctor.err" || {
+  /bin/cat "$test_tmp/doctor.out" "$test_tmp/doctor.err" >&2
+  fail "doctor did not pass on a healthy stopped fixture"
+}
 /usr/bin/grep -F 'alias gpu-main -> 192.0.2.10: managed route OK' "$test_tmp/doctor.out" >/dev/null || fail "doctor did not validate the main alias"
 /usr/bin/grep -F 'alias gpu-include -> 192.0.2.20: managed route OK' "$test_tmp/doctor.out" >/dev/null || fail "doctor did not validate the included alias"
 /usr/bin/grep -F 'all checks passed' "$test_tmp/doctor.out" >/dev/null || fail "doctor success summary missing"
@@ -741,7 +753,7 @@ fake_ssh_log_q="${(qqq)fake_ssh_log}"
 } >"$fake_ssh"
 /bin/chmod 755 "$fake_ssh"
 fake_ssh_q="${(qqq)fake_ssh}"
-/usr/bin/sed "s#typeset -gr ssh_client=\"/usr/bin/ssh\"#typeset -gr ssh_client=$fake_ssh_q#" \
+/usr/bin/sed "s#^typeset -gr ssh_client=.*#typeset -gr ssh_client=$fake_ssh_q#" \
   "$test_tmp/doctor-real-shvpn" >"$test_tmp/shvpn-with-fake-ssh"
 /usr/bin/install -m 755 "$test_tmp/shvpn-with-fake-ssh" "$fixture_home/.local/bin/shvpn"
 HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" reconnect >"$test_tmp/reconnect-success.out" 2>"$test_tmp/reconnect-success.err" || fail "reconnect fixture success path failed"
@@ -910,7 +922,7 @@ post_migration_backup_count="$(/usr/bin/find "$fixture_home/.local/lib/shanghait
 assert_count 0 'Host gpu' "$fixture_home/.ssh/config"
 assert_count 0 'Host 192.0.2.10' "$fixture_home/.ssh/config"
 assert_count 1 'Match final host 192.0.2.10,192.0.2.20' "$fixture_home/.ssh/config"
-/usr/bin/grep -Fx $'format\t3' "$manifest_path" >/dev/null || fail "legacy migration did not write manifest format 3"
+/usr/bin/grep -Fx $'format\t4' "$manifest_path" >/dev/null || fail "legacy migration did not write manifest format 4"
 assert_manifest_hash config-helper "$fixture_home/.local/lib/shanghaitech-shvpn/configure-targets.zsh" "$manifest_path"
 assert_manifest_hash uninstall-helper "$fixture_home/.local/lib/shanghaitech-shvpn/uninstall.zsh" "$manifest_path"
 /usr/bin/awk -v begin="$begin_ssh" -v end="$end_ssh" '
@@ -935,7 +947,7 @@ HOME="$fixture_home" PATH="$fixture_path" "$fixture_repo/install.zsh" --non-inte
   --target 192.0.2.10 \
   --target 192.0.2.20 \
   --add-path >/dev/null
-/usr/bin/grep -Fx $'format\t3' "$manifest_path" >/dev/null || fail "format-2 migration did not write manifest format 3"
+/usr/bin/grep -Fx $'format\t4' "$manifest_path" >/dev/null || fail "format-2 migration did not write manifest format 4"
 assert_manifest_hash login-helper "$fixture_home/.local/lib/shanghaitech-shvpn/python-login-helper.py" "$manifest_path"
 assert_manifest_hash login-requirements "$fixture_home/.local/lib/shanghaitech-shvpn/requirements-login.txt" "$manifest_path"
 
@@ -1063,6 +1075,11 @@ if [[ "${SHVPN_RUN_UPSTREAM:-0}" == "1" ]]; then
     go build -trimpath -ldflags='-s -w -buildid= -X main.zjuConnectVersion=v1.2.2-shanghaitech-nodefix1' -o "$test_tmp/zju-connect" .)
   /usr/bin/codesign --verify --strict "$test_tmp/zju-connect"
   [[ "$("$test_tmp/zju-connect" -version)" == "ZJU Connect v1.2.2-shanghaitech-nodefix1" ]] || fail "built client failed its version smoke test"
+  for linux_arch in amd64 arm64; do
+    (cd "$patched_dir" && GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH="$linux_arch" GOFLAGS=-mod=readonly \
+      go build -trimpath -ldflags='-s -w -buildid= -X main.zjuConnectVersion=v1.2.2-shanghaitech-nodefix1' -o "$test_tmp/zju-connect-linux-$linux_arch" .)
+    /usr/bin/file "$test_tmp/zju-connect-linux-$linux_arch" | /usr/bin/grep -F 'ELF 64-bit' >/dev/null || fail "Linux $linux_arch cross-build is not an ELF binary"
+  done
 fi
 
 print -r -- "All shanghaitech-shvpn tests passed."

@@ -406,11 +406,32 @@ def cleanup_login(
         raise cleanup_error
 
 
-def run_login(package_dir: Path, launcher: Path, state_dir: Path) -> int:
+def safe_external_executable(path: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+    except (FileNotFoundError, OSError):
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid in (0, os.getuid())
+        and not (info.st_mode & 0o002)
+        and os.access(resolved, os.X_OK)
+    )
+
+
+def run_login(
+    package_dir: Path,
+    launcher: Path,
+    state_dir: Path,
+    chrome_executable: Path | None = None,
+) -> int:
     if not _owned_nonsymlink(package_dir, directory=True):
         raise LoginError("unsafe managed Playwright runtime")
     if not _owned_nonsymlink(launcher, directory=False) or not os.access(launcher, os.X_OK):
         raise LoginError("unsafe managed VPN launcher")
+    if chrome_executable is not None and not safe_external_executable(chrome_executable):
+        raise LoginError("unsafe Google Chrome executable")
     ensure_private_dir(state_dir)
     profile = state_dir / "cas-chrome-profile"
     ensure_private_dir(profile)
@@ -447,11 +468,9 @@ def run_login(package_dir: Path, launcher: Path, state_dir: Path) -> int:
         if not monitor.wait_for(lambda: monitor.callback_prompt, 30.0, process):
             raise LoginError("VPN client did not request a CAS callback")
         with sanitized_process_environment(), sync_playwright() as playwright:
-            context = playwright.chromium.launch_persistent_context(
-                str(profile),
-                channel="chrome",
-                headless=False,
-                args=[
+            browser_options = {
+                "headless": False,
+                "args": [
                     "--no-proxy-server",
                     "--no-first-run",
                     "--no-default-browser-check",
@@ -459,8 +478,13 @@ def run_login(package_dir: Path, launcher: Path, state_dir: Path) -> int:
                     "--disable-sync",
                     "--disable-extensions",
                 ],
-                service_workers="block",
-            )
+                "service_workers": "block",
+            }
+            if chrome_executable is None:
+                browser_options["channel"] = "chrome"
+            else:
+                browser_options["executable_path"] = str(chrome_executable.resolve(strict=True))
+            context = playwright.chromium.launch_persistent_context(str(profile), **browser_options)
             _clear_vpn_cookies(context)
             page = context.pages[0] if context.pages else context.new_page()
             cdp = context.new_cdp_session(page)
@@ -508,6 +532,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tree-digest", type=Path)
     parser.add_argument("--package-dir", type=Path)
     parser.add_argument("--launcher", type=Path)
+    parser.add_argument("--chrome-executable", type=Path)
     parser.add_argument("--state-dir", type=Path)
     return parser.parse_args(argv)
 
@@ -517,9 +542,9 @@ def main(argv: list[str]) -> int:
     if args.tree_digest is not None:
         print(tree_digest(args.tree_digest))
         return 0
-    if not args.package_dir or not args.launcher or not args.state_dir:
+    if not args.package_dir or not args.launcher or not args.chrome_executable or not args.state_dir:
         raise LoginError("missing managed login helper arguments")
-    return run_login(args.package_dir, args.launcher, args.state_dir)
+    return run_login(args.package_dir, args.launcher, args.state_dir, args.chrome_executable)
 
 
 if __name__ == "__main__":

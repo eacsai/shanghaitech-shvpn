@@ -1,16 +1,43 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 
 set -eu
 setopt extendedglob
 umask 077
 
 typeset -gr project_root="${0:A:h}"
+typeset -gr platform_helper="$project_root/libexec/platform.zsh"
 typeset -gr begin_ssh="# >>> shanghaitech-shvpn managed SSH targets >>>"
 typeset -gr end_ssh="# <<< shanghaitech-shvpn managed SSH targets <<<"
 typeset -gr begin_path="# >>> shanghaitech-shvpn managed PATH >>>"
 typeset -gr end_path="# <<< shanghaitech-shvpn managed PATH <<<"
-typeset -gr current_uid="$(/usr/bin/id -u)"
 typeset -g config_lock_fd
+
+[[ -f "$platform_helper" && ! -L "$platform_helper" ]] || {
+  print -u2 -r -- "install: platform helper is missing or unsafe"
+  exit 69
+}
+source "$platform_helper"
+shvpn_detect_platform || {
+  print -u2 -r -- "install: supported platforms are Apple Silicon macOS, Linux amd64, and Linux arm64"
+  exit 69
+}
+for command_name in zsh git go ssh nc lsof id ps pgrep nohup; do
+  shvpn_resolve_command "$command_name" || {
+    print -u2 -r -- "install: required command not found: $command_name"
+    exit 69
+  }
+  typeset -g "${command_name}_bin=$REPLY"
+done
+typeset -gr current_uid="$($id_bin -u)"
+typeset -gr platform_id="$shvpn_platform_id"
+codesign_bin=""
+if [[ "$shvpn_os" == "Darwin" ]]; then
+  shvpn_resolve_command codesign || {
+    print -u2 -r -- "install: required command not found: codesign"
+    exit 69
+  }
+  codesign_bin="$REPLY"
+fi
 
 say_error() {
   print -u2 -r -- "$*"
@@ -27,7 +54,15 @@ usage() {
 }
 
 sha_file() {
-  REPLY="$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}')" || return 1
+  shvpn_sha_file "$1"
+}
+
+stat_uid() {
+  shvpn_stat_uid "$1"
+}
+
+stat_mode() {
+  shvpn_stat_mode "$1"
 }
 
 safe_login_python() {
@@ -36,12 +71,30 @@ safe_login_python() {
   [[ -x "$python_bin" ]] || return 1
   resolved="${python_bin:A}"
   [[ -f "$resolved" && -x "$resolved" && ! -L "$resolved" ]] || return 1
-  owner="$(/usr/bin/stat -f %u "$resolved" 2>/dev/null)" || return 1
+  stat_uid "$resolved" || return 1
+  owner="$REPLY"
   [[ "$owner" == 0 || "$owner" == "$current_uid" ]] || return 1
-  mode="$(/usr/bin/stat -f %Lp "$resolved" 2>/dev/null)" || return 1
+  stat_mode "$resolved" || return 1
+  mode="$REPLY"
   [[ "$mode" == <-> ]] || return 1
   permission=$(( 8#$mode ))
   (( (permission & 8#022) == 0 ))
+}
+
+safe_chrome_executable() {
+  local chrome_path="$1"
+  local resolved mode owner permission
+  [[ -x "$chrome_path" ]] || return 1
+  resolved="${chrome_path:A}"
+  [[ -f "$resolved" && -x "$resolved" && ! -L "$resolved" ]] || return 1
+  stat_uid "$resolved" || return 1
+  owner="$REPLY"
+  [[ "$owner" == 0 || "$owner" == "$current_uid" ]] || return 1
+  stat_mode "$resolved" || return 1
+  mode="$REPLY"
+  [[ "$mode" == <-> ]] || return 1
+  permission=$(( 8#$mode ))
+  (( (permission & 8#002) == 0 ))
 }
 
 discover_login_python() {
@@ -73,7 +126,8 @@ safe_regular_or_absent() {
   local file_path="$1"
   if [[ -e "$file_path" || -L "$file_path" ]]; then
     [[ -f "$file_path" && ! -L "$file_path" ]] || return 1
-    [[ "$(/usr/bin/stat -f %u "$file_path" 2>/dev/null)" == "$current_uid" ]] || return 1
+    stat_uid "$file_path" || return 1
+    [[ "$REPLY" == "$current_uid" ]] || return 1
   fi
   return 0
 }
@@ -82,7 +136,8 @@ ensure_private_dir() {
   local dir_path="$1"
   if [[ -e "$dir_path" || -L "$dir_path" ]]; then
     [[ -d "$dir_path" && ! -L "$dir_path" ]] || die 69 "unsafe directory: $dir_path"
-    [[ "$(/usr/bin/stat -f %u "$dir_path" 2>/dev/null)" == "$current_uid" ]] || die 69 "directory is not owned by the current user: $dir_path"
+    stat_uid "$dir_path" || die 69 "cannot inspect directory owner: $dir_path"
+    [[ "$REPLY" == "$current_uid" ]] || die 69 "directory is not owned by the current user: $dir_path"
   else
     /usr/bin/install -d -m 700 "$dir_path" || die 74 "cannot create directory: $dir_path"
   fi
@@ -93,7 +148,8 @@ ensure_owned_dir() {
   local dir_path="$1"
   if [[ -e "$dir_path" || -L "$dir_path" ]]; then
     [[ -d "$dir_path" && ! -L "$dir_path" ]] || die 69 "unsafe directory: $dir_path"
-    [[ "$(/usr/bin/stat -f %u "$dir_path" 2>/dev/null)" == "$current_uid" ]] || die 69 "directory is not owned by the current user: $dir_path"
+    stat_uid "$dir_path" || die 69 "cannot inspect directory owner: $dir_path"
+    [[ "$REPLY" == "$current_uid" ]] || die 69 "directory is not owned by the current user: $dir_path"
   else
     /usr/bin/install -d -m 700 "$dir_path" || die 74 "cannot create directory: $dir_path"
   fi
@@ -179,7 +235,8 @@ snapshot_path() {
   if [[ -f "$file_path" ]]; then
     sha_file "$file_path" || die 74 "cannot hash: $file_path"
     local digest="$REPLY"
-    local mode="$(/usr/bin/stat -f %Lp "$file_path")"
+    stat_mode "$file_path" || die 74 "cannot inspect mode: $file_path"
+    local mode="$REPLY"
     print -r -- "present${TAB}${digest}${TAB}${mode}" >"$snapshot_dir/$key.state"
     /bin/cp -p "$file_path" "$snapshot_dir/$key.file" || die 74 "cannot back up: $file_path"
   else
@@ -270,7 +327,8 @@ collect_literal_ssh_names() {
       continue
     fi
     if [[ "$config_file" != "$root_config" ]]; then
-      if [[ "$physical_file" != "$ssh_root"/* || "$(/usr/bin/stat -f %u "$config_file" 2>/dev/null)" != "$current_uid" ]]; then
+      stat_uid "$config_file" || { mark_alias_scan_incomplete; continue; }
+      if [[ "$physical_file" != "$ssh_root"/* || "$REPLY" != "$current_uid" ]]; then
         mark_alias_scan_incomplete
         continue
       fi
@@ -332,7 +390,8 @@ collect_literal_ssh_names() {
             include_matches=( ${~include_pattern}(N) )
             for include_match in "${include_matches[@]}"; do
               physical_match="${include_match:A}"
-              if [[ ! -f "$include_match" || -L "$include_match" || "$physical_match" != "$ssh_root"/* || "$(/usr/bin/stat -f %u "$include_match" 2>/dev/null)" != "$current_uid" ]]; then
+              stat_uid "$include_match" || { mark_alias_scan_incomplete; continue; }
+              if [[ ! -f "$include_match" || -L "$include_match" || "$physical_match" != "$ssh_root"/* || "$REPLY" != "$current_uid" ]]; then
                 mark_alias_scan_incomplete
                 continue
               fi
@@ -406,16 +465,25 @@ for target_host in "${target_hosts[@]}"; do
   seen_hosts[$target_host]=1
 done
 
-[[ "$(/usr/bin/uname -s)" == "Darwin" && "$(/usr/bin/uname -m)" == "arm64" ]] || die 69 "version 1 supports Apple Silicon macOS only"
-for command_name in zsh git go codesign ssh nc shasum lsof; do
-  command -v "$command_name" >/dev/null 2>&1 || die 69 "required command not found: $command_name"
-done
+autoload -Uz is-at-least
+is-at-least 5.8 "$ZSH_VERSION" || die 69 "zsh 5.8 or newer is required"
+if [[ "$shvpn_os" == "Linux" ]]; then
+  nc_help="$("$nc_bin" -h 2>&1 || true)"
+  [[ "$nc_help" == *'-x '* && "$nc_help" == *'-X '* ]] || die 69 "Linux requires an OpenBSD-compatible netcat with SOCKS5 -x/-X support"
+  shvpn_resolve_command google-chrome || shvpn_resolve_command google-chrome-stable || die 69 "Google Chrome is required for automatic CAS login"
+  chrome_bin="$REPLY"
+else
+  chrome_bin="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  [[ -f "$chrome_bin" && ! -L "$chrome_bin" && -x "$chrome_bin" ]] || die 69 "Google Chrome is required for automatic CAS login"
+fi
+safe_chrome_executable "$chrome_bin" || die 69 "Google Chrome executable is unsafe"
 discover_login_python
 
 home_dir="${HOME:A}"
 [[ -d "$home_dir" && ! -L "$home_dir" && "$home_dir" == /* ]] || die 69 "HOME is not a safe physical directory"
 [[ "$home_dir" != *$'\n'* && "$home_dir" != *$'\r'* && "$home_dir" != *$'\t'* && "$home_dir" != *'|'* ]] || die 69 "HOME contains unsupported characters"
-[[ "$(/usr/bin/stat -f %u "$home_dir")" == "$current_uid" ]] || die 69 "HOME is not owned by the current user"
+stat_uid "$home_dir" || die 69 "cannot inspect HOME ownership"
+[[ "$REPLY" == "$current_uid" ]] || die 69 "HOME is not owned by the current user"
 
 bin_dir="$home_dir/.local/bin"
 lib_dir="$home_dir/.local/lib/shanghaitech-shvpn"
@@ -431,14 +499,38 @@ config_dir="$home_dir/.config/shanghaitech-shvpn"
 targets_file="$config_dir/targets.tsv"
 ssh_dir="$home_dir/.ssh"
 ssh_config="$ssh_dir/config"
-zshrc="$home_dir/.zshrc"
+if [[ "$shvpn_os" == "Darwin" ]]; then
+  zshrc="$home_dir/.zshrc"
+  state_dir="$home_dir/Library/Application Support/ShanghaitechVPN"
+else
+  xdg_state_home="${XDG_STATE_HOME:-$home_dir/.local/state}"
+  [[ "$xdg_state_home" == /* && "$xdg_state_home" != *$'\n'* && "$xdg_state_home" != *$'\r'* && "$xdg_state_home" != *$'\t'* && "$xdg_state_home" != *'|'* ]] || die 69 "XDG_STATE_HOME is unsafe"
+  state_dir="${xdg_state_home:A}/shanghaitech-shvpn"
+  zshrc="$home_dir/.profile"
+fi
 client="$bin_dir/zju-connect"
 launcher="$bin_dir/shanghaitech-vpn"
 shvpn="$bin_dir/shvpn"
 route="$bin_dir/shanghaitech-ssh-route"
-state_dir="$home_dir/Library/Application Support/ShanghaitechVPN"
 config_lock="$state_dir/shvpn.config.lock"
 TAB=$'\t'
+
+# Reuse the exact format-4 state location before taking the lifecycle lock.
+# This prevents a changed XDG_STATE_HOME from creating a second lock domain.
+if [[ -f "$manifest" && ! -L "$manifest" ]]; then
+  safe_regular_or_absent "$manifest" || die 69 "refusing unsafe install manifest"
+  stat_mode "$manifest" || die 69 "cannot inspect install manifest mode"
+  [[ "$REPLY" == "600" ]] || die 69 "install manifest has unsafe mode"
+  manifest_get format "$manifest" || die 65 "invalid install manifest"
+  if [[ "$REPLY" == "4" ]]; then
+    manifest_get platform "$manifest" || die 65 "install manifest is missing platform"
+    [[ "$REPLY" == "$platform_id" ]] || die 65 "installation belongs to a different platform: $REPLY"
+    manifest_get state-dir "$manifest" || die 65 "install manifest is missing state directory"
+    [[ "$REPLY" == /* && "$REPLY" != *$'\n'* && "$REPLY" != *$'\r'* && "$REPLY" != *$'\t'* && "$REPLY" != *'|'* ]] || die 65 "install manifest has an unsafe state directory"
+    state_dir="${REPLY:A}"
+    config_lock="$state_dir/shvpn.config.lock"
+  fi
+fi
 
 for managed_path in "$client" "$launcher" "$shvpn" "$route" "$targets_file" "$ssh_config" "$zshrc" "$manifest" "$config_helper" "$uninstall_helper" "$login_helper" "$login_requirements" "$config_lock"; do
   safe_regular_or_absent "$managed_path" || die 69 "refusing unsafe path: $managed_path"
@@ -452,10 +544,19 @@ acquire_config_lock "$config_lock"
 existing_install=0
 if [[ -f "$manifest" ]]; then
   existing_install=1
-  [[ "$(/usr/bin/stat -f %Lp "$manifest")" == "600" ]] || die 69 "install manifest has unsafe mode"
+  stat_mode "$manifest" || die 69 "cannot inspect install manifest mode"
+  [[ "$REPLY" == "600" ]] || die 69 "install manifest has unsafe mode"
   manifest_get format "$manifest" || die 65 "invalid install manifest"
   install_format="$REPLY"
-  [[ "$install_format" == "1" || "$install_format" == "2" || "$install_format" == "3" ]] || die 65 "unsupported install manifest"
+  [[ "$install_format" == "1" || "$install_format" == "2" || "$install_format" == "3" || "$install_format" == "4" ]] || die 65 "unsupported install manifest"
+  if [[ "$install_format" == "4" ]]; then
+    manifest_get platform "$manifest" || die 65 "install manifest is missing platform"
+    [[ "$REPLY" == "$platform_id" ]] || die 65 "installation belongs to a different platform: $REPLY"
+    manifest_get state-dir "$manifest" || die 65 "install manifest is missing state directory"
+    [[ "${REPLY:A}" == "$state_dir" ]] || die 65 "install manifest state directory changed"
+  elif [[ "$platform_id" != "darwin-arm64" ]]; then
+    die 65 "legacy install manifests are supported only on Apple Silicon macOS"
+  fi
   manifest_get path-choice "$manifest" || die 65 "invalid install manifest"
   [[ "$REPLY" == "$path_choice" ]] || die 65 "PATH policy changed; run uninstall.zsh before reinstalling"
   for spec in \
@@ -472,14 +573,15 @@ if [[ -f "$manifest" ]]; then
     sha_file "$managed_path" || die 74 "cannot hash managed file: $managed_path"
     [[ "$REPLY" == "$expected_sha" ]] || die 65 "managed file was modified; refusing overwrite: $managed_path"
   done
-  if [[ "$install_format" == "2" || "$install_format" == "3" ]]; then
+  if [[ "$install_format" == "2" || "$install_format" == "3" || "$install_format" == "4" ]]; then
     for spec in \
       "config-helper:$config_helper" \
       "uninstall-helper:$uninstall_helper"; do
       key="${spec%%:*}"
       managed_path="${spec#*:}"
       [[ -f "$managed_path" && -x "$managed_path" ]] || die 65 "managed helper is missing: $managed_path"
-      [[ "$(/usr/bin/stat -f %Lp "$managed_path")" == "700" ]] || die 69 "managed helper has unsafe mode: $managed_path"
+      stat_mode "$managed_path" || die 69 "cannot inspect managed helper mode: $managed_path"
+      [[ "$REPLY" == "700" ]] || die 69 "managed helper has unsafe mode: $managed_path"
       manifest_get "$key" "$manifest" || die 65 "invalid install manifest entry: $key"
       expected_sha="$REPLY"
       sha_file "$managed_path" || die 74 "cannot hash managed helper: $managed_path"
@@ -488,7 +590,7 @@ if [[ -f "$manifest" ]]; then
   elif [[ -e "$config_helper" || -L "$config_helper" || -e "$uninstall_helper" || -L "$uninstall_helper" ]]; then
     die 65 "incomplete format-1 migration detected; run the repository uninstall.zsh, then reinstall"
   fi
-  if [[ "$install_format" == "3" ]]; then
+  if [[ "$install_format" == "3" || "$install_format" == "4" ]]; then
     for spec in "login-helper:$login_helper" "login-requirements:$login_requirements"; do
       key="${spec%%:*}"
       managed_path="${spec#*:}"
@@ -498,7 +600,9 @@ if [[ -f "$manifest" ]]; then
       sha_file "$managed_path" || die 74 "cannot hash managed login file"
       [[ "$REPLY" == "$expected_sha" ]] || die 65 "managed login file was modified; refusing overwrite"
     done
-    [[ -d "$login_packages" && ! -L "$login_packages" && "$(/usr/bin/stat -f %u "$login_packages")" == "$current_uid" ]] || die 65 "managed Python package tree is missing or unsafe"
+    [[ -d "$login_packages" && ! -L "$login_packages" ]] || die 65 "managed Python package tree is missing or unsafe"
+    stat_uid "$login_packages" || die 65 "cannot inspect managed Python package tree"
+    [[ "$REPLY" == "$current_uid" ]] || die 65 "managed Python package tree is missing or unsafe"
     manifest_get login-python "$manifest" || die 65 "missing recorded Python"
     manifest_get login-python-version "$manifest" || die 65 "missing recorded Python version"
     manifest_get login-python-sha256 "$manifest" || die 65 "missing recorded Python hash"
@@ -577,7 +681,7 @@ trap 'exit 130' INT TERM
 
 : >"$work_dir/zsystem-flock-smoke.lock"
 /bin/chmod 600 "$work_dir/zsystem-flock-smoke.lock" || die 74 "cannot harden zsystem flock smoke file"
-/bin/zsh -fc 'zmodload zsh/system && typeset -g operation_lock_fd && zsystem flock -t 0 -f operation_lock_fd -e "$1"' \
+"$zsh_bin" -fc 'zmodload zsh/system && typeset -g operation_lock_fd && zsystem flock -t 0 -f operation_lock_fd -e "$1"' \
   shvpn-lock-smoke "$work_dir/zsystem-flock-smoke.lock" || die 69 "zsh/system nonblocking flock is unavailable"
 
 "$project_root/libexec/build-client.zsh" "$work_dir/zju-connect"
@@ -601,12 +705,24 @@ quote_for_zsh "$backup_root"; backup_root_q="$REPLY"
 quote_for_zsh "$login_helper"; login_helper_q="$REPLY"
 quote_for_zsh "$login_requirements"; login_requirements_q="$REPLY"
 quote_for_zsh "$login_packages"; login_packages_q="$REPLY"
+quote_for_zsh "$platform_id"; platform_id_q="$REPLY"
+quote_for_zsh "$shvpn_stat"; stat_bin_q="$REPLY"
+quote_for_zsh "$shvpn_sha256"; sha_bin_q="$REPLY"
+quote_for_zsh "$ssh_bin"; ssh_bin_q="$REPLY"
+quote_for_zsh "$nc_bin"; nc_bin_q="$REPLY"
+quote_for_zsh "$lsof_bin"; lsof_bin_q="$REPLY"
+quote_for_zsh "$ps_bin"; ps_bin_q="$REPLY"
+quote_for_zsh "$pgrep_bin"; pgrep_bin_q="$REPLY"
+quote_for_zsh "$zsh_bin"; zsh_bin_q="$REPLY"
+quote_for_zsh "$nohup_bin"; nohup_bin_q="$REPLY"
+quote_for_zsh "$chrome_bin"; chrome_bin_q="$REPLY"
 route_proxy="$route_command_q %h %p"
 quote_for_zsh "$route_proxy"; route_proxy_q="$REPLY"
 
 content="$(<"$project_root/libexec/shanghaitech-vpn.zsh")"
 content="${content//@@CLIENT_Q@@/$client_q}"
 content="${content//@@STATE_DIR_Q@@/$state_dir_q}"
+content="${content//@@NC_BIN_Q@@/$nc_bin_q}"
 [[ "$content" != *'@@'* ]] || die 65 "unresolved launcher template token"
 print -rn -- "$content" >"$work_dir/shanghaitech-vpn"
 
@@ -626,6 +742,17 @@ content="${content//@@CONFIG_LOCK_Q@@/$config_lock_q}"
 content="${content//@@LOGIN_HELPER_Q@@/$login_helper_q}"
 content="${content//@@LOGIN_REQUIREMENTS_Q@@/$login_requirements_q}"
 content="${content//@@LOGIN_PACKAGES_Q@@/$login_packages_q}"
+content="${content//@@PLATFORM_ID_Q@@/$platform_id_q}"
+content="${content//@@STAT_BIN_Q@@/$stat_bin_q}"
+content="${content//@@SHA_BIN_Q@@/$sha_bin_q}"
+content="${content//@@SSH_BIN_Q@@/$ssh_bin_q}"
+content="${content//@@NC_BIN_Q@@/$nc_bin_q}"
+content="${content//@@LSOF_BIN_Q@@/$lsof_bin_q}"
+content="${content//@@PS_BIN_Q@@/$ps_bin_q}"
+content="${content//@@PGREP_BIN_Q@@/$pgrep_bin_q}"
+content="${content//@@ZSH_BIN_Q@@/$zsh_bin_q}"
+content="${content//@@NOHUP_BIN_Q@@/$nohup_bin_q}"
+content="${content//@@CHROME_BIN_Q@@/$chrome_bin_q}"
 [[ "$content" != *'@@'* ]] || die 65 "unresolved shvpn template token"
 print -rn -- "$content" >"$work_dir/shvpn"
 
@@ -638,6 +765,10 @@ content="${content//@@MANIFEST_Q@@/$manifest_q}"
 content="${content//@@CONFIG_HELPER_Q@@/$config_helper_q}"
 content="${content//@@CONFIG_LOCK_Q@@/$config_lock_q}"
 content="${content//@@BACKUP_ROOT_Q@@/$backup_root_q}"
+content="${content//@@PLATFORM_ID_Q@@/$platform_id_q}"
+content="${content//@@STAT_BIN_Q@@/$stat_bin_q}"
+content="${content//@@SHA_BIN_Q@@/$sha_bin_q}"
+content="${content//@@SSH_BIN_Q@@/$ssh_bin_q}"
 [[ "$content" != *'@@'* ]] || die 65 "unresolved configuration helper template token"
 print -rn -- "$content" >"$work_dir/configure-targets.zsh"
 
@@ -648,12 +779,15 @@ print -rn -- "$content" >"$work_dir/configure-targets.zsh"
 content="$(<"$project_root/libexec/shanghaitech-ssh-route.zsh")"
 content="${content//@@SHVPN_Q@@/$shvpn_q}"
 content="${content//@@TARGETS_Q@@/$targets_q}"
+content="${content//@@PLATFORM_ID_Q@@/$platform_id_q}"
+content="${content//@@STAT_BIN_Q@@/$stat_bin_q}"
+content="${content//@@NC_BIN_Q@@/$nc_bin_q}"
 [[ "$content" != *'@@'* ]] || die 65 "unresolved route template token"
 print -rn -- "$content" >"$work_dir/shanghaitech-ssh-route"
 
 /bin/chmod 700 "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route" "$work_dir/configure-targets.zsh" "$work_dir/uninstall.zsh" "$work_dir/python-login-helper.py"
 /bin/chmod 600 "$work_dir/requirements-login.txt"
-/bin/zsh -n "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route" "$work_dir/configure-targets.zsh" "$work_dir/uninstall.zsh" || die 65 "rendered helper syntax check failed"
+"$zsh_bin" -n "$work_dir/shanghaitech-vpn" "$work_dir/shvpn" "$work_dir/shanghaitech-ssh-route" "$work_dir/configure-targets.zsh" "$work_dir/uninstall.zsh" || die 65 "rendered helper syntax check failed"
 "$login_python" -I -B -m py_compile "$work_dir/python-login-helper.py" || die 65 "login helper syntax check failed"
 
 : >"$work_dir/targets.tsv"
@@ -684,10 +818,12 @@ strip_marked_block "$ssh_config" "$work_dir/ssh.base" "$begin_ssh" "$end_ssh" ||
 collect_literal_ssh_names "$work_dir/ssh.base" "$ssh_dir"
 append_block "$work_dir/ssh.base" "$work_dir/ssh.block" "$work_dir/ssh.config"
 
-discovered_ssh="$(command -v ssh)"
 typeset -a ssh_candidates
 typeset -A seen_ssh_clients
-ssh_candidates=(/usr/bin/ssh /opt/homebrew/bin/ssh "$discovered_ssh")
+ssh_candidates=("$ssh_bin")
+if [[ "$shvpn_os" == "Darwin" ]]; then
+  ssh_candidates+=(/usr/bin/ssh /opt/homebrew/bin/ssh)
+fi
 for target_host in "${target_hosts[@]}"; do
   validated_ssh_clients=0
   seen_ssh_clients=()
@@ -807,7 +943,9 @@ snapshot_path "$history_dir" manifest "$manifest"
 
 writes_started=1
 atomic_install "$work_dir/zju-connect" "$client" 755 || die 74 "cannot install zju-connect"
-/usr/bin/codesign --verify --strict "$client" || die 65 "installed zju-connect signature verification failed"
+if [[ -n "$codesign_bin" ]]; then
+  "$codesign_bin" --verify --strict "$client" || die 65 "installed zju-connect signature verification failed"
+fi
 atomic_install "$work_dir/shanghaitech-vpn" "$launcher" 755 || die 74 "cannot install launcher"
 atomic_install "$work_dir/shvpn" "$shvpn" 755 || die 74 "cannot install shvpn"
 atomic_install "$work_dir/shanghaitech-ssh-route" "$route" 755 || die 74 "cannot install route helper"
@@ -848,7 +986,9 @@ done
 sha_file "$work_dir/ssh.block"; ssh_block_sha="$REPLY"
 sha_file "$ssh_config"; ssh_full_sha="$REPLY"
 {
-  print -r -- "format${TAB}3"
+  print -r -- "format${TAB}4"
+  print -r -- "platform${TAB}$platform_id"
+  print -r -- "state-dir${TAB}$state_dir"
   print -r -- "path-choice${TAB}$path_choice"
   /bin/cat "$work_dir/install.manifest.tsv"
   print -r -- "login-packages${TAB}$login_packages_sha"
@@ -900,4 +1040,4 @@ fi
 for target_host in "${target_hosts[@]}"; do
   print -r -- "  ssh $target_host"
 done
-print -r -- "安装器没有启动 VPN，也没有修改 Clash 或 macOS 系统代理。"
+print -r -- "安装器没有启动 VPN，也没有修改 Clash、系统代理、TUN 或系统路由。"
