@@ -178,7 +178,8 @@ class Context:
     def close(self): self.closed = True
 class Chromium:
     def launch_persistent_context(self, *args, **kwargs):
-        global LAST_CONTEXT
+        global LAST_CONTEXT, LAST_LAUNCH_KWARGS
+        LAST_LAUNCH_KWARGS = kwargs
         LAST_CONTEXT = Context(); return LAST_CONTEXT
 class Manager:
     chromium = Chromium()
@@ -214,9 +215,10 @@ def sync_playwright(): return Manager()
 
             fake_process = FakeProcess()
 
-            def fake_popen(*args, **kwargs):
-                fake_process.environment = kwargs["env"]
-                return fake_process
+            def fake_spawn(launcher_path, environment):
+                fake_process.environment = environment
+                self.assertEqual(Path(launcher_path), launcher)
+                return fake_process, fake_process.stdout
 
             def fake_killpg(pid, sig):
                 self.assertEqual(pid, fake_process.pid)
@@ -229,7 +231,7 @@ def sync_playwright(): return Manager()
             try:
                 with mock.patch.object(HELPER, "_port_is_free", return_value=True), mock.patch.object(
                     HELPER.time, "sleep", return_value=None
-                ), mock.patch.object(HELPER.subprocess, "Popen", side_effect=fake_popen), mock.patch.object(
+                ), mock.patch.object(HELPER, "spawn_vpn_client", side_effect=fake_spawn), mock.patch.object(
                     HELPER.os, "killpg", side_effect=fake_killpg
                 ), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
                     self.assertEqual(HELPER.run_login(package, launcher, state), 0)
@@ -252,6 +254,8 @@ def sync_playwright(): return Manager()
             self.assertEqual([cookie["domain"] for cookie in context._cookies], ["ids.shanghaitech.edu.cn"])
             failed = [command for command, _ in context.cdp.commands]
             self.assertIn("Fetch.failRequest", failed)
+            self.assertIn("--no-sandbox", sync_module.LAST_LAUNCH_KWARGS["args"])
+            self.assertIn("--disable-dev-shm-usage", sync_module.LAST_LAUNCH_KWARGS["args"])
             self.assertNotIn("ST-EXAMPLE", stdout.getvalue() + stderr.getvalue())
             for artifact in state.rglob("*"):
                 if artifact.is_file():
@@ -351,6 +355,67 @@ def sync_playwright(): return Manager()
         with mock.patch("builtins.open", side_effect=OSError):
             with self.assertRaises(HELPER.LoginError):
                 HELPER.read_sms_code(0.01)
+
+    def test_sms_falls_back_to_stdin_when_dev_tty_is_unavailable(self):
+        stdin = mock.Mock()
+        stdin.isatty.return_value = True
+        stdin.fileno.return_value = 0
+        stdin.readline.return_value = "123456\n"
+        stderr = mock.Mock()
+        stderr.isatty.return_value = True
+
+        def fake_getattr(_fd):
+            return [0, 0, 0, HELPER.termios.ECHO, 0, 0, []]
+
+        with mock.patch("builtins.open", side_effect=OSError), mock.patch.object(
+            HELPER.sys, "stdin", stdin
+        ), mock.patch.object(HELPER.sys, "stderr", stderr), mock.patch.object(
+            HELPER.termios, "tcgetattr", side_effect=fake_getattr
+        ), mock.patch.object(HELPER.termios, "tcsetattr"), mock.patch.object(
+            HELPER.select, "select", return_value=([stdin], [], [])
+        ):
+            self.assertEqual(HELPER.read_sms_code(1.0), "123456")
+        stderr.write.assert_any_call("SMS verification code: ")
+
+    def test_spawn_pty_flushes_block_buffered_callback_prompt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            launcher = Path(temp) / "launcher"
+            launcher.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "print('Please enter the callback url:')\n"
+                "sys.stdin.readline()\n"
+            )
+            launcher.chmod(0o700)
+            process = None
+            stream = None
+            try:
+                process, stream = HELPER.spawn_vpn_client(launcher, os.environ.copy())
+                self.assertTrue(process.stdin)
+                monitor = HELPER.OutputMonitor(stream)
+                monitor.start()
+                self.assertTrue(monitor.wait_for(lambda: monitor.callback_prompt, 5.0, process))
+                process.stdin.write(b"ok\n")
+                process.stdin.flush()
+                process.stdin.close()
+                self.assertEqual(process.wait(timeout=5), 0)
+            finally:
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                if stream is not None:
+                    stream.close()
+
+    def test_resolve_chrome_binary_prefers_sibling_chrome(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            wrapper = root / "google-chrome"
+            binary = root / "chrome"
+            wrapper.write_text("#!/bin/sh\n")
+            binary.write_text("#!/bin/sh\n")
+            wrapper.chmod(0o755)
+            binary.chmod(0o755)
+            self.assertEqual(HELPER.resolve_chrome_binary(wrapper), binary)
 
 
 if __name__ == "__main__":

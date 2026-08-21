@@ -186,7 +186,10 @@ class OutputMonitor:
 
     def _read(self) -> None:
         while True:
-            chunk = self.stream.read(512)  # type: ignore[attr-defined]
+            try:
+                chunk = self.stream.read(512)  # type: ignore[attr-defined]
+            except OSError:
+                chunk = b""
             with self.condition:
                 if not chunk:
                     self.eof = True
@@ -212,25 +215,45 @@ class OutputMonitor:
 
 
 def read_sms_code(timeout: float = 300.0) -> str:
+    owned = False
+    prompt = None
     try:
         tty = open("/dev/tty", "r+", encoding="utf-8", buffering=1)
+        owned = True
+        prompt = tty
     except OSError as exc:
+        # Some desktop terminals attach stdin to a PTY without a controlling
+        # /dev/tty. Fall back to the current interactive stdin in that case.
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            raise LoginError("SMS verification requires an interactive terminal") from exc
+        tty = sys.stdin
+        prompt = sys.stderr
+    try:
+        fd = tty.fileno()
+        old = termios.tcgetattr(fd)
+    except (OSError, termios.error) as exc:
+        if owned:
+            tty.close()
         raise LoginError("SMS verification requires an interactive terminal") from exc
-    with tty:
-        old = termios.tcgetattr(tty.fileno())
+    try:
+        prompt.write("SMS verification code: ")
+        prompt.flush()
+        new = termios.tcgetattr(fd)
+        new[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        readable, _, _ = select.select([tty], [], [], timeout)
+        if not readable:
+            raise LoginError("SMS verification timed out")
+        code = tty.readline().rstrip("\r\n")
+        prompt.write("\n")
+        prompt.flush()
+    finally:
         try:
-            tty.write("SMS verification code: ")
-            tty.flush()
-            new = termios.tcgetattr(tty.fileno())
-            new[3] &= ~termios.ECHO
-            termios.tcsetattr(tty.fileno(), termios.TCSADRAIN, new)
-            readable, _, _ = select.select([tty], [], [], timeout)
-            if not readable:
-                raise LoginError("SMS verification timed out")
-            code = tty.readline().rstrip("\r\n")
-            tty.write("\n")
-        finally:
-            termios.tcsetattr(tty.fileno(), termios.TCSADRAIN, old)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except termios.error:
+            pass
+        if owned:
+            tty.close()
     if not code or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in code):
         raise LoginError("invalid SMS verification code")
     return code
@@ -420,6 +443,42 @@ def safe_external_executable(path: Path) -> bool:
     )
 
 
+def resolve_chrome_binary(chrome_executable: Path) -> Path:
+    resolved = chrome_executable.resolve(strict=True)
+    sibling = resolved.parent / "chrome"
+    if sibling != resolved and safe_external_executable(sibling):
+        return sibling
+    return resolved
+
+
+def spawn_vpn_client(
+    launcher: Path, environment: dict[str, str]
+) -> tuple[subprocess.Popen[bytes], object]:
+    # zju-connect logs to os.Stdout. Go fully buffers stdout when it is a
+    # pipe, so the CAS callback prompt never arrives. A PTY makes stdout a
+    # terminal and restores line buffering. stdin stays a pipe so this helper
+    # can submit the captured callback and SMS code.
+    if not hasattr(os, "openpty"):
+        raise LoginError("PTY support is required to read VPN client prompts")
+    master_fd, slave_fd = os.openpty()
+    try:
+        process = subprocess.Popen(
+            [str(launcher)],
+            stdin=subprocess.PIPE,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            start_new_session=True,
+            env=environment,
+            close_fds=True,
+        )
+    except Exception:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
+    os.close(slave_fd)
+    return process, os.fdopen(master_fd, "rb", buffering=0)
+
+
 def run_login(
     package_dir: Path,
     launcher: Path,
@@ -447,6 +506,7 @@ def run_login(
         raise LoginError("managed Playwright runtime is unavailable") from exc
 
     process: subprocess.Popen[bytes] | None = None
+    client_output = None
     context = page = cdp = None
     capture = CallbackCapture()
     success = False
@@ -454,19 +514,22 @@ def run_login(
     try:
         with sanitized_process_environment():
             environment = os.environ.copy()
-            process = subprocess.Popen(
-                [str(launcher)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                env=environment,
-            )
-        assert process.stdin is not None and process.stdout is not None
-        monitor = OutputMonitor(process.stdout)
+            process, client_output = spawn_vpn_client(launcher, environment)
+        assert process.stdin is not None and client_output is not None
+        monitor = OutputMonitor(client_output)
         monitor.start()
-        if not monitor.wait_for(lambda: monitor.callback_prompt, 30.0, process):
+        print(
+            "shvpn login: waiting for the VPN client to request CAS...",
+            file=sys.stderr,
+            flush=True,
+        )
+        if not monitor.wait_for(lambda: monitor.callback_prompt, 120.0, process):
             raise LoginError("VPN client did not request a CAS callback")
+        print(
+            "shvpn login: opening the dedicated Chrome login window...",
+            file=sys.stderr,
+            flush=True,
+        )
         with sanitized_process_environment(), sync_playwright() as playwright:
             browser_options = {
                 "headless": False,
@@ -477,13 +540,18 @@ def run_login(
                     "--disable-session-crashed-bubble",
                     "--disable-sync",
                     "--disable-extensions",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
                 ],
                 "service_workers": "block",
             }
             if chrome_executable is None:
                 browser_options["channel"] = "chrome"
             else:
-                browser_options["executable_path"] = str(chrome_executable.resolve(strict=True))
+                browser_options["executable_path"] = str(
+                    resolve_chrome_binary(chrome_executable)
+                )
             context = playwright.chromium.launch_persistent_context(str(profile), **browser_options)
             _clear_vpn_cookies(context)
             page = context.pages[0] if context.pages else context.new_page()
@@ -521,6 +589,11 @@ def run_login(
         try:
             cleanup_login(process, context, page, cdp, profile, state_dir)
         finally:
+            if client_output is not None:
+                try:
+                    client_output.close()
+                except Exception:
+                    pass
             restore_cancellation_handlers(previous_handlers)
     if not success:
         raise LoginError("VPN login did not complete")

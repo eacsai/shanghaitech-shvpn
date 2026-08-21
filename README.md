@@ -36,6 +36,13 @@ cd shanghaitech-shvpn
 ./install.zsh
 ```
 
+Linux 桌面请按 [LINUX_SETUP.md](LINUX_SETUP.md) 安装。若 Linux 支持尚未合入默认分支，使用：
+
+```zsh
+git clone --branch codex/linux-support --single-branch \
+  https://github.com/eacsai/shanghaitech-shvpn.git
+```
+
 安装器只询问至少一个需要代理的服务器地址，不询问 alias、用户名、端口、密码、验证码、私钥或 callback URL。安装后新开终端，首次或登录过期时运行 `shvpn login`：它会打开独立的 Chrome 登录窗口，自动捕获并安全提交 CAS callback，成功后自动切换到后台 VPN。以后运行 `shvpn` 即可复用登录状态。
 
 非交互安装：

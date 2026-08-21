@@ -1,5 +1,7 @@
 .DS_Store
 *.log
+*.pyc
+__pycache__/
 client-data.json
 install.manifest.tsv
 zju-connect

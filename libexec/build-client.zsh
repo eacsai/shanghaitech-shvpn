@@ -1,6 +1,7 @@
 #!/usr/bin/env zsh
 
 set -eu
+setopt extendedglob
 umask 077
 
 typeset -gr upstream_url="https://github.com/Mythologyli/zju-connect.git"
