@@ -34,6 +34,7 @@ typeset -gr ssh_client=@@SSH_BIN_Q@@
 typeset -gr client_data="$state_dir/client-data.json"
 typeset -gr log_file="$state_dir/shvpn.log"
 typeset -gr lock_file="$state_dir/shvpn.operation.lock"
+typeset -gr desired_file="$state_dir/desired"
 typeset -gr bind_host="127.0.0.1"
 typeset -gr bind_port="11080"
 typeset -gr current_uid="$(/usr/bin/id -u)"
@@ -785,6 +786,24 @@ acquire_operation_lock() {
   return 0
 }
 
+record_desired_state() {
+  local desired="$1"
+  local desired_tmp=""
+  if [[ -L "$desired_file" || ( -e "$desired_file" && ! -f "$desired_file" ) ]]; then
+    say_error "shvpn: warning: unsafe desired-state path; '$desired' was not recorded: $desired_file"
+    return 1
+  fi
+  if desired_tmp="$(/usr/bin/mktemp "$state_dir/.desired.XXXXXX" 2>/dev/null)" \
+    && { print -r -- "$desired" >"$desired_tmp" } 2>/dev/null \
+    && /bin/chmod 600 "$desired_tmp" 2>/dev/null \
+    && /bin/mv -f "$desired_tmp" "$desired_file" 2>/dev/null; then
+    return 0
+  fi
+  [[ -n "$desired_tmp" ]] && /bin/rm -f -- "$desired_tmp" 2>/dev/null
+  say_error "shvpn: warning: cannot record desired VPN state '$desired': $desired_file"
+  return 1
+}
+
 show_status() {
   local pid rc
 
@@ -1106,9 +1125,9 @@ case "$action" in
     acquire_config_lock || exit $?
     acquire_operation_lock || exit $?
     case "$action" in
-      start) start_vpn ;;
-      stop) stop_vpn ;;
-      login) login_vpn ;;
+      start) record_desired_state up; start_vpn ;;
+      stop) record_desired_state down; stop_vpn ;;
+      login) record_desired_state up; login_vpn ;;
     esac
     exit $?
     ;;

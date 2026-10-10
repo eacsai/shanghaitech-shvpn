@@ -30,6 +30,7 @@ for script in "$project_root"/*.zsh "$project_root"/libexec/*.zsh "$project_root
 done
 PYTHONDONTWRITEBYTECODE=1 python3 -I -B "$project_root/tests/test_login_helper.py" || fail "login helper tests failed"
 "$project_root/tests/test_platform.zsh" || fail "platform mapping tests failed"
+"$project_root/tests/test_desired_state.zsh" || fail "desired-state tests failed"
 
 temp_parent="${${TMPDIR:-/tmp}:A}"
 test_tmp="$(mktemp -d "$temp_parent/shvpn-linux-tests.XXXXXX")"

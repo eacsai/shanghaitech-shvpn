@@ -55,6 +55,7 @@ for python_candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 "$(comm
 done
 [[ -n "$test_python" ]] || fail "Python 3.10-3.14 is required for login helper tests"
 "$test_python" -I -B "$project_root/tests/test_login_helper.py" || fail "automatic login helper tests failed"
+"$project_root/tests/test_desired_state.zsh" || fail "desired-state tests failed"
 
 expected_paths=(
   .github/workflows/ci.yml
@@ -78,6 +79,7 @@ expected_paths=(
   patches/zju-connect-v1.2.2-node-selection.patch
   requirements-login.txt
   tests/test.zsh
+  tests/test_desired_state.zsh
   tests/test_linux.zsh
   tests/test_login_helper.py
   tests/test_platform.zsh
@@ -91,6 +93,7 @@ actual_paths=("${(@f)$({
     libexec/platform.zsh \
     libexec/shvpn-config.zsh \
     requirements-login.txt \
+    tests/test_desired_state.zsh \
     tests/test_linux.zsh \
     tests/test_login_helper.py \
     tests/test_platform.zsh \
