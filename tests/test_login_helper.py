@@ -256,6 +256,8 @@ def sync_playwright(): return Manager()
             self.assertIn("Fetch.failRequest", failed)
             self.assertIn("--no-sandbox", sync_module.LAST_LAUNCH_KWARGS["args"])
             self.assertIn("--disable-dev-shm-usage", sync_module.LAST_LAUNCH_KWARGS["args"])
+            # HTTP/2 connection reuse sends the CAS page to the vpn host (404).
+            self.assertIn("--disable-http2", sync_module.LAST_LAUNCH_KWARGS["args"])
             self.assertNotIn("ST-EXAMPLE", stdout.getvalue() + stderr.getvalue())
             for artifact in state.rglob("*"):
                 if artifact.is_file():

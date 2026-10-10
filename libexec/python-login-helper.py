@@ -534,6 +534,10 @@ def run_login(
             browser_options = {
                 "headless": False,
                 "args": [
+                    # ids and vpn share one IP and vpn's *.shanghaitech.edu.cn
+                    # certificate, so over HTTP/2 Chrome sends the CAS page
+                    # request down the vpn connection and gets aTrust's 404.
+                    "--disable-http2",
                     "--no-proxy-server",
                     "--no-first-run",
                     "--no-default-browser-check",
