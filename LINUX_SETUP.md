@@ -125,5 +125,6 @@ shvpn reconnect gpu-alias
 | `THESE PACKAGES DO NOT MATCH THE HASHES`（playwright） | 登录依赖锁需要包含本机架构的 Linux wheel。当前分支已加入 amd64 Playwright / greenlet 官方哈希。 |
 | `Go go1.25.6 linux/amd64 is required` | 构建只用官方 Go 1.25.6，并把该 `go` 放在 `PATH` 最前。 |
 | Chrome 窗口空白或无法启动 | 容器/无沙箱桌面需要 `--no-sandbox` 等参数；当前分支会传给专用登录 Chrome。 |
+| 登录页显示 404（页面标题 “aTrust 2.0”），刷新偶尔能好 | ids 与 vpn 两个域名解析到同一 IP，vpn 的证书覆盖 `*.shanghaitech.edu.cn`，Chrome 的 HTTP/2 连接复用把 CAS 请求发到了 vpn 服务器。当前分支给专用登录 Chrome 传 `--disable-http2`；旧安装可在 `chrome://net-internals/#sockets` 点 Flush socket pools 后刷新。 |
 
 不要把 `client-data.json`、CAS cookie、callback、完整日志或 SSH 私钥提交到 GitHub。
