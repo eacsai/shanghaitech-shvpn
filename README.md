@@ -36,13 +36,6 @@ cd shanghaitech-shvpn
 ./install.zsh
 ```
 
-Linux 桌面请按 [LINUX_SETUP.md](LINUX_SETUP.md) 安装。若 Linux 支持尚未合入默认分支，使用：
-
-```zsh
-git clone --branch codex/linux-support --single-branch \
-  https://github.com/eacsai/shanghaitech-shvpn.git
-```
-
 安装器只询问至少一个需要代理的服务器地址，不询问 alias、用户名、端口、密码、验证码、私钥或 callback URL。安装后新开终端，首次或登录过期时运行 `shvpn login`：它会打开独立的 Chrome 登录窗口，自动捕获并安全提交 CAS callback，成功后自动切换到后台 VPN。以后运行 `shvpn` 即可复用登录状态。
 
 非交互安装：
@@ -55,6 +48,28 @@ git clone --branch codex/linux-support --single-branch \
 ```
 
 `--add-path` 在 macOS 修改 `~/.zshrc`，在 Linux 修改 `~/.profile`。不想修改时换成 `--no-path`，并使用安装器输出的完整命令路径。
+
+## 升级已有安装
+
+升级仍需上述 Go、Python、Chrome 等依赖，并会重新构建客户端与登录运行时。先保存当前**完整目标清单**（含后来用 `shvpn add` 添加的目标，见 `~/.config/shanghaitech-shvpn/targets.tsv`），并确认原安装的 PATH 策略（`~/.local/lib/shanghaitech-shvpn/install.manifest.tsv` 中的 `path-choice`）。重装会用本次传入的清单替换原清单，且要求 PATH 策略与原安装一致。
+
+先在源码目录用 `git status --short` 确认没有未提交修改，并确认当前分支为 `main`，再更新源码：
+
+```zsh
+git pull --ff-only origin main
+```
+
+若有未提交修改或无法快进，先处理本地修改，或另行克隆新目录。升级会替换正在使用的程序；安排好 VPN 连接中断后，主动运行 `shvpn stop` 并确认 `shvpn status` 显示 stopped，再重装。例如，原 PATH 策略为 `add` 时，将下列示例替换为自己的完整目标清单：
+
+```zsh
+./install.zsh --non-interactive \
+  --target gpu1.example.edu \
+  --target gpu2.example.edu \
+  --add-path
+shvpn doctor
+```
+
+原 PATH 策略为 `none` 时使用 `--no-path`，并按安装器输出的完整路径调用命令。安装器会检查现有文件并保存备份；哈希不匹配、托管块被修改或迁移状态不完整时，应先处理报错，勿手工替换 helper 或修改清单哈希。登录状态会保留；完成检查后运行 `shvpn start`，需要重新认证时运行 `shvpn login`。
 
 ## 命令
 
@@ -132,6 +147,30 @@ ssh gpu
 普通错误会自动回滚。极端的断电或 `SIGKILL` 可能留下已备份但未完成的多文件更新；此时不要手工猜测清单，使用仓库中的 `./uninstall.zsh` 恢复/退役受信安装，再重新安装。旧格式迁移中出现未被清单记录的 helper 或登录运行时也采用同一恢复方式。
 
 `shvpn uninstall` 不删除 `client-data.json`、日志或卸载恢复归档，也绝不会停止占用 SOCKS 端口的无关进程。若命令内卸载不可用，可在仓库目录运行 `./uninstall.zsh`。
+
+## 登录与连接排障
+
+先运行 `shvpn status`。若显示 stopped，SSH helper 会直连目标；校外访问校内地址通常需要先运行 `shvpn start`。SSH 命令本身不会按需启动 VPN。若后台启动要求 CAS callback 后遇到 EOF，说明当前会话需要重新认证，应在桌面终端运行 `shvpn login`。缓存文件存在也不代表学校网关仍接受其中的会话；DNS 故障和重新认证应分别排查。
+
+`CAS browser navigation failed` 表示专用 Chrome 未能完成 CAS 导航；附带的 DNS、TLS、网络、超时或窗口错误类别可用于缩小范围。DNS 错误时先确认 `vpn.shanghaitech.edu.cn` 和 `ids.shanghaitech.edu.cn` 在登录前就能解析、访问。登录 helper 会移除继承的代理环境并让专用 Chrome 直连，但系统 DNS 仍可能受现有代理软件的 DNS 策略影响。
+
+**仅供已在使用 Mihomo / Clash Meta 的用户：** 若已确认学校后缀策略把公开认证入口交给了校外不可达的校内 DNS，可在现有 `dns.nameserver-policy` 映射开头添加两个精确例外，选择当前网络可达的公共 DoH，例如：
+
+```yaml
+dns:
+  nameserver-policy:
+    ids.shanghaitech.edu.cn:
+      - https://dns.alidns.com/dns-query
+    vpn.shanghaitech.edu.cn:
+      - https://dns.alidns.com/dns-query
+    # 保留原有其他条目，尤其是 +.shanghaitech.edu.cn 的校内 DNS 策略。
+```
+
+精确域名匹配优先于同一策略段的通配匹配；把例外放在映射开头也可避免被更早的规则集策略匹配。请在现有客户端的持久配置或覆写中修改、验证并应用，保留其他 DNS 与路由规则。参见 [Mihomo DNS 配置](https://wiki.metacubex.one/config/dns/)。`shvpn` 不会修改代理配置或自动应用这些例外。修复解析后，再运行 `shvpn login` 完成需要的认证。
+
+登录页出现标题为 “aTrust 2.0” 的 404 时，可按上述步骤升级；当前专用 Chrome 已传入 `--disable-http2`，用于避免认证域名之间的 HTTP/2 连接复用问题。更多 Linux 问题见 [Linux 登录排障](LINUX_SETUP.md#6-linux-登录排障)。
+
+安装器不创建常驻 keeper 或开机服务。自行添加的 launchd `RunAtLoad` 启动项只在加载时尝试启动一次，不能保证 VPN 退出后恢复。`desired` 文件只记录 up/down 意图；当前命令没有内置轮询恢复或自动重新认证功能。
 
 请勿公开密码、验证码、CAS callback、cookie/ticket、私钥、`client-data.json`、完整日志、完整 SSH 配置或真实校内地址。详细边界见 [SECURITY.md](SECURITY.md)。让 Codex 代为配置时可复制 [CODEX_SETUP.md](CODEX_SETUP.md)。
 

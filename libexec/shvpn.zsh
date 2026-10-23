@@ -931,7 +931,7 @@ start_vpn() {
   fi
 
   print -r -- "=== shvpn start $(/bin/date -u +%Y-%m-%dT%H:%M:%SZ) command-pid=$$ ===" >>"$log_file"
-  "$nohup_bin" "$launcher" </dev/null >>"$log_file" 2>&1 &
+  "$nohup_bin" "$zsh_bin" "$launcher" </dev/null >>"$log_file" 2>&1 &
   wrapper_pid=$!
 
   for (( i = 0; i < 80; i++ )); do

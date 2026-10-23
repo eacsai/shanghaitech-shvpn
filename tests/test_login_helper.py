@@ -102,6 +102,48 @@ class CallbackTests(unittest.TestCase):
         self.assertEqual(len(duplicate.urls), 1)
         self.assertEqual([item[1]["requestId"] for item in cdp.failed[-2:]], ["one", "two"])
 
+    def test_navigation_diagnoses_failures_without_disclosing_urls(self):
+        class Error(Exception):
+            pass
+
+        class TimeoutError(Error):
+            pass
+
+        cases = [
+            (Error("net::ERR_NAME_NOT_RESOLVED"), "DNS resolution failed"),
+            (Error("net::ERR_CERT_AUTHORITY_INVALID"), "TLS certificate verification failed"),
+            (Error("net::ERR_CERT_DATE_INVALID"), "TLS certificate verification failed"),
+            (Error("net::ERR_CERT_COMMON_NAME_INVALID"), "TLS certificate verification failed"),
+            (Error("net::ERR_CONNECTION_TIMED_OUT"), "network connection failed"),
+            (Error("net::ERR_TIMED_OUT"), "network connection failed"),
+            (Error("net::ERR_CONNECTION_REFUSED"), "network connection failed"),
+            (Error("net::ERR_CONNECTION_RESET"), "network connection failed"),
+            (Error("net::ERR_NETWORK_CHANGED"), "network connection failed"),
+            (Error("net::ERR_INTERNET_DISCONNECTED"), "network connection failed"),
+            (TimeoutError("Timeout exceeded"), "page load timed out"),
+            (Error("Target page, context or browser has been closed"), "login window closed"),
+            (Error("unknown failure"), "CAS browser navigation failed"),
+        ]
+        for failure, diagnosis in cases:
+            failure.args = (str(failure) + " at https://example.test/?ticket=ST-DO-NOT-PRINT",)
+
+            class Page:
+                def goto(self, *args, **kwargs):
+                    raise failure
+
+            with self.subTest(diagnosis=diagnosis), self.assertRaises(HELPER.LoginError) as caught:
+                HELPER.navigate_to_entry(Page(), HELPER.CallbackCapture(), Error)
+            self.assertIn(diagnosis, str(caught.exception))
+            self.assertNotIn("ST-DO-NOT-PRINT", str(caught.exception))
+            self.assertNotIn("example.test", str(caught.exception))
+            self.assertTrue(caught.exception.__suppress_context__)
+
+            # An intentional callback interception remains a successful outcome
+            # even when Playwright reports a navigation error.
+            captured = HELPER.CallbackCapture()
+            captured.urls.append("https://vpn.shanghaitech.edu.cn/passport/v1/auth/cas?ticket=ST-EXAMPLE")
+            HELPER.navigate_to_entry(Page(), captured, Error)
+
 
 class DigestTests(unittest.TestCase):
     def test_digest_is_path_sorted_and_rejects_symlinks(self):
@@ -417,7 +459,7 @@ def sync_playwright(): return Manager()
             binary.write_text("#!/bin/sh\n")
             wrapper.chmod(0o755)
             binary.chmod(0o755)
-            self.assertEqual(HELPER.resolve_chrome_binary(wrapper), binary)
+            self.assertEqual(HELPER.resolve_chrome_binary(wrapper), binary.resolve())
 
 
 if __name__ == "__main__":

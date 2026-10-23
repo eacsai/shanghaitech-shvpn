@@ -29,8 +29,7 @@ nc -h 2>&1 | grep -- '-X'
 把需要经过 VPN 的服务器地址逐个传给 `--target`：
 
 ```bash
-git clone --branch codex/linux-support --single-branch \
-  https://github.com/eacsai/shanghaitech-shvpn.git
+git clone https://github.com/eacsai/shanghaitech-shvpn.git
 cd shanghaitech-shvpn
 ./install.zsh --non-interactive \
   --target gpu1.example.edu \
@@ -120,11 +119,12 @@ shvpn reconnect gpu-alias
 
 | 现象 | 原因与处理 |
 |---|---|
-| 停在 “opening the dedicated ShanghaiTech CAS login window”，Chrome 不出现 | VPN 客户端把 CAS 提示写到 stdout，管道下 Go 会全量缓冲。当前分支用 PTY 读取提示；请使用本仓库 Linux 分支，不要用只含 macOS 锁文件的旧提交。 |
-| `SMS verification requires an interactive terminal`，Chrome 随即关闭 | 必须在图形桌面终端运行 `shvpn login`。当前分支在 `/dev/tty` 不可用时回退到 stdin。 |
-| `THESE PACKAGES DO NOT MATCH THE HASHES`（playwright） | 登录依赖锁需要包含本机架构的 Linux wheel。当前分支已加入 amd64 Playwright / greenlet 官方哈希。 |
+| 停在 “opening the dedicated ShanghaiTech CAS login window”，Chrome 不出现 | 当前版本用 PTY 读取 VPN 客户端提示；请按 README 升级，不要继续使用只含 macOS 锁文件的旧安装。 |
+| `SMS verification requires an interactive terminal`，Chrome 随即关闭 | 必须在图形桌面终端运行 `shvpn login`。当前版本在 `/dev/tty` 不可用时回退到 stdin。 |
+| `THESE PACKAGES DO NOT MATCH THE HASHES`（playwright） | 当前锁文件包含 amd64 / arm64 的官方 Linux wheel 哈希；请按 README 升级完整运行时，不要关闭哈希校验。 |
 | `Go go1.25.6 linux/amd64 is required` | 构建只用官方 Go 1.25.6，并把该 `go` 放在 `PATH` 最前。 |
-| Chrome 窗口空白或无法启动 | 容器/无沙箱桌面需要 `--no-sandbox` 等参数；当前分支会传给专用登录 Chrome。 |
-| 登录页显示 404（页面标题 “aTrust 2.0”），刷新偶尔能好 | ids 与 vpn 两个域名解析到同一 IP，vpn 的证书覆盖 `*.shanghaitech.edu.cn`，Chrome 的 HTTP/2 连接复用把 CAS 请求发到了 vpn 服务器。当前分支给专用登录 Chrome 传 `--disable-http2`；旧安装可在 `chrome://net-internals/#sockets` 点 Flush socket pools 后刷新。 |
+| Chrome 窗口空白或无法启动 | 专用登录 Chrome 已传入 `--no-sandbox` 等兼容参数；确认 Chrome 与本机架构、图形桌面匹配。 |
+| 登录页显示 404（页面标题 “aTrust 2.0”），刷新偶尔能好 | 当前专用登录 Chrome 通过 `--disable-http2` 避免认证域名间的 HTTP/2 连接复用问题；按 README 升级旧安装。 |
+| `CAS browser navigation failed: DNS resolution failed` | 登录前就要能解析公开 VPN/CAS 域名；已有 Mihomo 用户可按 README 的精确域名例外排查。安装器不会修改代理配置。 |
 
 不要把 `client-data.json`、CAS cookie、callback、完整日志或 SSH 私钥提交到 GitHub。

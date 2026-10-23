@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
   pull_request:
 
 permissions:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,17 @@ jobs:
         run: /bin/zsh tests/test.zsh
 
   linux:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+            machine: x86_64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            machine: aarch64
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -47,14 +57,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y zsh openssh-client lsof netcat-openbsd
+          if ! command -v google-chrome && ! command -v google-chrome-stable; then
+            curl --fail --location --retry 2 \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_${{ matrix.arch }}.deb" \
+              --output "$RUNNER_TEMP/google-chrome.deb"
+            sudo apt-get install -y "$RUNNER_TEMP/google-chrome.deb"
+          fi
       - name: Verify Linux toolchain
         run: |
           test "$(uname -s)" = Linux
-          test "$(uname -m)" = x86_64
-          test "$(go version)" = "go version go1.25.6 linux/amd64"
+          test "$(uname -m)" = '${{ matrix.machine }}'
+          test "$(go version)" = 'go version go1.25.6 linux/${{ matrix.arch }}'
           command -v google-chrome || command -v google-chrome-stable
       - name: Run Linux installation integration gates
         run: /usr/bin/zsh tests/test_linux.zsh
+      - name: Verify the real pinned login runtime and bundled driver
+        run: |
+          /usr/bin/zsh libexec/build-login-runtime.zsh "$(command -v python3)" \
+            requirements-login.txt "$RUNNER_TEMP/login-packages"
+          python3 -I -B - "$RUNNER_TEMP/login-packages" <<'PY'
+          import sys
+          sys.path.insert(0, sys.argv[1])
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as playwright:
+              assert playwright.chromium.name == "chromium"
+          PY
       - name: Build and execute the pinned native Linux client
         run: |
           /usr/bin/zsh libexec/build-client.zsh "$RUNNER_TEMP/zju-connect"

@@ -7,7 +7,7 @@
 
 1. 先阅读 README.md、SECURITY.md 和 install.zsh；只询问一个或多个服务器地址。
 2. 不要询问、读取或输出密码、验证码、SSH 私钥、VPN callback URL、client-data.json、完整日志或完整 SSH 配置。
-3. 不要修改或退出 Clash Verge，不要修改系统代理、TUN、aTrust、远程服务器或现有 SSH 会话。
+3. 不要修改或退出现有代理软件，不要修改系统代理、TUN、aTrust、远程服务器或现有 SSH 会话。
 4. 确认设备是 Apple Silicon macOS，或 amd64/arm64 Linux 桌面；go version 必须是 go1.25.6 且 GOOS/GOARCH 与本机一致，并有 zsh 5.8+、Python 3.10–3.14（含 pip）和 Google Chrome。Linux 还需 lsof 与 netcat-openbsd。
 5. 使用：
    ./install.zsh --non-interactive --target HOST [重复 --target HOST ...] --add-path
@@ -17,6 +17,8 @@
 8. 首次认证或过期时，让我亲自在终端运行 shvpn login 并完成专用 Chrome 窗口中的登录。脚本会自动捕获 callback；不要读取、输出或要求我复制它，也不要代替我处理验证码。
 9. 遇到符号链接、所有者异常、哈希不匹配、托管标记歧义、SSH 冲突或不可信端口时立即停止，不要强制覆盖、kill 或删除。
 10. Linux 首次认证必须在有 DISPLAY 或 WAYLAND_DISPLAY 的桌面会话执行 shvpn login；不要尝试从纯 SSH shell 伪造显示环境。
+11. 升级已有安装时，按 README 的升级步骤确认完整目标清单、原 PATH 策略和依赖；不要把本次提供的少量目标当成全部目标覆盖原清单。先说明升级的连接中断，等我选择维护时间后再停止 VPN、重装并检查；不要手改已安装 helper 或清单哈希。
+12. CAS 导航失败时先区分 DNS、TLS、网络、超时或窗口问题。只检查固定公开认证域名的解析与可达性，不读取认证内容。若现有 Mihomo 的 DNS 策略造成登录前的循环依赖，参考 README 的精确域名例外，先解释需要修改的具体配置；安装 shvpn 本身不授权修改代理配置。
 ```
 
 成功时，`command -v shvpn` 指向 `~/.local/bin/shvpn`；配置目标的 `ssh -G HOST` 中 `hostname` 与输入完全一致，`proxycommand` 指向绝对路径的 `shanghaitech-ssh-route %h %p`；未配置目标不应获得该代理。
@@ -24,3 +26,5 @@
 用户已有 alias 会按最终 `HostName` 自动接入，字符串必须与某个已配置地址完全一致，不能通过 DNS 推断等价。安全的 `~/.ssh` Include 会被检查；若枚举不完整，只解释警告并建议用户运行 `shvpn doctor ALIAS`，不要把 alias 变成安装必填项。
 
 后续可用 `shvpn add HOST_OR_ALIAS` 和 `shvpn remove HOST_OR_ALIAS` 管理目标。不要自动运行 `shvpn reconnect`：它会请求匹配的 ControlMaster 退出，可能中断终端、VS Code 或 Codex。卸载优先使用 `shvpn uninstall`；只有命令内卸载不可用或迁移中断时才使用仓库的 `./uninstall.zsh`。
+
+`shvpn status` 显示 stopped 时，SSH helper 会直连，不会自动启动 VPN。`shvpn start` 只能尝试复用学校网关仍接受的会话；需要 CAS callback 而遇到 EOF 时，让用户在桌面终端运行 `shvpn login`。DNS 修复不等于完成重新认证。安装器不创建常驻 keeper；单独的 launchd `RunAtLoad` 启动项和 `desired` 文件都不保证掉线恢复。

@@ -57,6 +57,7 @@ launcher="$bin_dir/shanghaitech-vpn"
 shvpn="$bin_dir/shvpn"
 listener_pid_file="$test_tmp/listener.pid"
 launch_snapshot="$test_tmp/launch-desired"
+launch_command_snapshot="$test_tmp/launch-command"
 client_command_file="$test_tmp/client-command"
 /usr/bin/install -d -m 700 "$fixture_home" "$bin_dir"
 
@@ -81,6 +82,8 @@ print -r -- 'exit 0' >>"$client"
   print -r -- '#!/bin/zsh'
   print -r -- "desired=${(qqq)desired}"
   print -r -- "snapshot=${(qqq)launch_snapshot}"
+  print -r -- "command_snapshot=${(qqq)launch_command_snapshot}"
+  print -r -- '/bin/ps -ww -p $$ -o command= >"$command_snapshot"'
   print -r -- 'if [[ -L "$desired" ]]; then print -r -- symlink >"$snapshot"'
   print -r -- 'elif [[ -f "$desired" ]]; then /bin/cat -- "$desired" >"$snapshot"'
   print -r -- 'elif [[ -e "$desired" ]]; then print -r -- not-regular >"$snapshot"'
@@ -235,6 +238,7 @@ expect_rc fresh-start 1
 /usr/bin/grep -F 'VPN start exited with status 7' "$test_tmp/fresh-start.err" >/dev/null || fail "fixture start did not reach the launcher"
 assert_desired up "start"
 [[ "$(<"$launch_snapshot")" == "up" ]] || fail "start launched the VPN before recording 'up' (saw $(<"$launch_snapshot"))"
+[[ "$(<"$launch_command_snapshot")" == "$zsh_bin $launcher" ]] || fail "launcher argv does not match the trusted wrapper identity"
 expect_no_warning fresh-start
 
 run_shvpn stopped-stop stop

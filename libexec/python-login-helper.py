@@ -291,9 +291,34 @@ def navigate_to_entry(page: object, capture: CallbackCapture, error_type: type[E
         page.goto(  # type: ignore[attr-defined]
             START_URL, wait_until="domcontentloaded", timeout=600_000
         )
-    except error_type:
+    except error_type as error:
         if not capture.urls:
-            raise LoginError("CAS browser navigation failed")
+            # Playwright's exception includes navigated URLs and can contain a
+            # CAS ticket. Emit only fixed diagnoses, never the exception itself.
+            detail = ""
+            message = str(error)
+            if "net::ERR_NAME_NOT_RESOLVED" in message:
+                detail = ": DNS resolution failed; check DNS for the VPN and CAS hosts (see README troubleshooting)"
+            elif any(code in message for code in (
+                "net::ERR_CERT_AUTHORITY_INVALID",
+                "net::ERR_CERT_DATE_INVALID",
+                "net::ERR_CERT_COMMON_NAME_INVALID",
+            )):
+                detail = ": TLS certificate verification failed; check certificates and system time"
+            elif any(code in message for code in (
+                "net::ERR_CONNECTION_TIMED_OUT",
+                "net::ERR_TIMED_OUT",
+                "net::ERR_CONNECTION_REFUSED",
+                "net::ERR_CONNECTION_RESET",
+                "net::ERR_NETWORK_CHANGED",
+                "net::ERR_INTERNET_DISCONNECTED",
+            )):
+                detail = ": network connection failed; check connectivity and retry shvpn login"
+            elif type(error).__name__ == "TimeoutError":
+                detail = ": page load timed out; check connectivity and retry shvpn login"
+            elif "Target page, context or browser has been closed" in message:
+                detail = ": login window closed; retry shvpn login"
+            raise LoginError("CAS browser navigation failed" + detail) from None
 
 
 def _safe_discard_profile(profile: Path) -> None:

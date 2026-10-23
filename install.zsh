@@ -616,6 +616,20 @@ if [[ -f "$manifest" ]]; then
   elif [[ -e "$login_helper" || -L "$login_helper" || -e "$login_requirements" || -L "$login_requirements" || -e "$login_packages" || -L "$login_packages" ]]; then
     die 65 "incomplete login runtime migration detected; uninstall before reinstalling"
   fi
+
+  # Only execute the existing helper after ownership and manifest hashes passed.
+  # Replacing a live Linux executable leaves its process on a deleted inode,
+  # which would make later status/stop identity checks reject that process.
+  if "$zsh_bin" "$shvpn" status >/dev/null 2>&1; then
+    existing_vpn_status=0
+  else
+    existing_vpn_status=$?
+  fi
+  case "$existing_vpn_status" in
+    0) die 75 "VPN is running; run 'shvpn stop' when ready, then reinstall" ;;
+    1) ;;
+    *) die 2 "existing VPN state is unsafe or cannot be verified; refusing reinstall" ;;
+  esac
 elif [[ -e "$lib_dir" || -L "$lib_dir" ]]; then
   [[ -d "$lib_dir" && ! -L "$lib_dir" ]] || die 69 "unsafe library directory: $lib_dir"
   die 65 "existing unrecognized installation metadata: $lib_dir"
