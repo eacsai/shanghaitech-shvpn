@@ -139,7 +139,8 @@ ssh_output="$(HOME="$fixture_home" ssh -F "$fixture_home/.ssh/config" -G -- gpu-
 resolved_host="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "hostname" {print $2; exit}')"
 resolved_proxy="$(print -r -- "$ssh_output" | /usr/bin/awk '$1 == "proxycommand" {$1=""; sub(/^ /, ""); print; exit}')"
 [[ "$resolved_host" == "192.0.2.10" ]] || fail "alias HostName was not preserved"
-[[ "$resolved_proxy" == "$fixture_home/.local/bin/shanghaitech-ssh-route %h %p" ]] || fail "alias did not receive the managed route"
+fixture_route="$fixture_home/.local/bin/shanghaitech-ssh-route"
+[[ "$resolved_proxy" == "${(qqq)fixture_route} %h %p" ]] || fail "alias did not receive the managed route: $resolved_proxy"
 
 set +e
 HOME="$fixture_home" "$fixture_home/.local/bin/shvpn" doctor gpu-alias >"$test_tmp/doctor.out" 2>"$test_tmp/doctor.err"
